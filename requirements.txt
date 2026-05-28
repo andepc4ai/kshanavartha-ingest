@@ -1,0 +1,7 @@
+feedparser==6.0.11
+google-cloud-firestore==2.18.0
+requests==2.32.3
+gTTS==2.5.4
+google-cloud-texttospeech==2.16.3
+boto3==1.35.49
+beautifulsoup4==4.12.3

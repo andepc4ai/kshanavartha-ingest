@@ -1,0 +1,26 @@
+# Local secrets — NEVER commit
+run-local.ps1
+run-local.env
+*.env
+.env.*
+
+# Python artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Test outputs
+dry_run_output.csv
+*.csv
+
+# IDE / OS
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db

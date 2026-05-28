@@ -1,0 +1,76 @@
+name: KshanaVartha — RSS Ingest (Public)
+
+on:
+  schedule:
+    # Every 30 minutes. Public repos get unlimited free GitHub Actions minutes.
+    # 48 runs/day keeps articles fresh without hammering AI free-tier RPD
+    # (dedup ensures each article is polished at most once across all runs).
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # manual trigger from the Actions tab
+
+concurrency:
+  group: kv-ingest
+  cancel-in-progress: false  # never interrupt a running ingest
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ingest
+        env:
+          # ── AI engines (priority: Cerebras → Gemini → SambaNova) ────────
+          # Cerebras — PRIMARY engine. gpt-oss-120b, strong Telugu, generous
+          # free tier. Comma-separated for multi-key rotation.
+          CEREBRAS_API_KEYS: ${{ secrets.CEREBRAS_API_KEYS }}
+          # Gemini Flash — secondary. ~200 RPD per key, rotates on 429.
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # SambaNova — fallback of last resort. Llama 3.3 70B, free tier.
+          SAMBANOVA_API_KEYS: ${{ secrets.SAMBANOVA_API_KEYS }}
+          # ── Firebase + R2 ───────────────────────────────────────────────
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          # Cloudflare R2 (articles.json, feed.json, audio MP3s).
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          # ── FCM push notifications ───────────────────────────────────────
+          # Set to "1" when device tokens are registered. Leave empty to skip.
+          FCM_ENABLED: ${{ secrets.FCM_ENABLED }}
+          # ── Non-sensitive tuning (GitHub Variables, not Secrets) ─────────
+          # All have safe defaults in code — only set these to override.
+          FIRESTORE_DB_ID: ${{ vars.FIRESTORE_DB_ID }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GEMINI_CALL_DELAY_S: ${{ vars.GEMINI_CALL_DELAY_S }}
+          MAX_PER_FEED: ${{ vars.MAX_PER_FEED }}
+          MAX_PER_VIDEO_FEED: ${{ vars.MAX_PER_VIDEO_FEED }}
+          MAX_TOTAL_GEMINI: ${{ vars.MAX_TOTAL_GEMINI }}
+          RETENTION_DAYS: ${{ vars.RETENTION_DAYS }}
+          AUDIO_MAX_PER_RUN: ${{ vars.AUDIO_MAX_PER_RUN }}
+          FEED_MAX: ${{ vars.FEED_MAX }}
+          CINEMA_MAX: ${{ vars.CINEMA_MAX }}
+          NOTIFICATION_GAP_HOURS: ${{ vars.NOTIFICATION_GAP_HOURS }}
+          CEREBRAS_CALL_DELAY_S: ${{ vars.CEREBRAS_CALL_DELAY_S }}
+          SAMBANOVA_CALL_DELAY_S: ${{ vars.SAMBANOVA_CALL_DELAY_S }}
+          # ── Optional / advanced ──────────────────────────────────────────
+          # GNEWS_RESOLVE_MAX: max Google News links to resolve per run (default 30)
+          GNEWS_RESOLVE_MAX: ${{ vars.GNEWS_RESOLVE_MAX }}
+          # DATA_GOV_API_KEY: data.gov.in key for mandi (source dead — future use)
+          DATA_GOV_API_KEY: ${{ secrets.DATA_GOV_API_KEY }}
+        run: python ingest.py
