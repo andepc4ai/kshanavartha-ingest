@@ -89,37 +89,37 @@ log = logging.getLogger("kv-ingest")
 # primary '(default)') because it was created via Console with that name.
 # Override with FIRESTORE_DB_ID GitHub Variable if your project uses a
 # different database name.
-FIRESTORE_DB_ID = os.environ.get("FIRESTORE_DB_ID", "default").strip()
+FIRESTORE_DB_ID = (os.environ.get("FIRESTORE_DB_ID") or "default").strip()
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
+GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-2.0-flash").strip()
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 )
-GEMINI_CALL_DELAY_S = float(os.environ.get("GEMINI_CALL_DELAY_S", "4.5"))
-MAX_PER_FEED = int(os.environ.get("MAX_PER_FEED", "8"))
+GEMINI_CALL_DELAY_S = float(os.environ.get("GEMINI_CALL_DELAY_S") or "4.5")
+MAX_PER_FEED = int(os.environ.get("MAX_PER_FEED") or "8")
 # Tighter cap for YouTube channel feeds. Video feeds are noisy — channels
 # publish many short clips a day and a single channel can dominate the
 # feed otherwise. 5 per cron × 48 crons/day = 240 video items/channel/day
 # max in steady state; the dedup filter means only truly-new ones process.
-MAX_PER_VIDEO_FEED = int(os.environ.get("MAX_PER_VIDEO_FEED", "5"))
+MAX_PER_VIDEO_FEED = int(os.environ.get("MAX_PER_VIDEO_FEED") or "5")
 # Google News links are unresolvable redirects with no image. We decode
 # them to the real publisher URL + scrape og:image/description. Capped
 # per run (3 HTTP calls each) so it can't blow the 15-min cron budget.
-GNEWS_RESOLVE_MAX = int(os.environ.get("GNEWS_RESOLVE_MAX", "30"))
-MAX_TOTAL_GEMINI = int(os.environ.get("MAX_TOTAL_GEMINI", "15"))
-RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "14"))
+GNEWS_RESOLVE_MAX = int(os.environ.get("GNEWS_RESOLVE_MAX") or "30")
+MAX_TOTAL_GEMINI = int(os.environ.get("MAX_TOTAL_GEMINI") or "15")
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS") or "14")
 DELETE_BATCH_SIZE = 400     # Firestore batch limit is 500 — keep headroom
 # Audio (edge-tts → R2) is filled incrementally: a capped number of
 # articles get narrated per run so a 250-article backlog spreads over a
 # few cron cycles instead of one slow run.
-AUDIO_MAX_PER_RUN = int(os.environ.get("AUDIO_MAX_PER_RUN", "30"))
-FEED_MAX = int(os.environ.get("FEED_MAX", "500"))    # public feed.json size cap
+AUDIO_MAX_PER_RUN = int(os.environ.get("AUDIO_MAX_PER_RUN") or "30")
+FEED_MAX = int(os.environ.get("FEED_MAX") or "500")    # public feed.json size cap
 # Cinema is capped independently so it never crowds out politics/farming.
 # Tune with CINEMA_MAX env var; 0 = no cap (not recommended).
-CINEMA_MAX = int(os.environ.get("CINEMA_MAX", "8"))
+CINEMA_MAX = int(os.environ.get("CINEMA_MAX") or "8")
 # Minimum hours between push notifications. Set via NOTIFICATION_GAP_HOURS
 # GitHub Variable. Default 3 h → max 8 pushes/day even on a fast news day.
-NOTIFICATION_GAP_HOURS = int(os.environ.get("NOTIFICATION_GAP_HOURS", "3"))
+NOTIFICATION_GAP_HOURS = int(os.environ.get("NOTIFICATION_GAP_HOURS") or "3")
 
 
 def _now_iso() -> str:
@@ -141,12 +141,12 @@ def _parse_dt(v) -> datetime | None:
 # Backfill (BACKFILL=1) is a manual operator run to re-polish existing
 # ai=False articles. It gets a higher Gemini cap since it's triggered when
 # quota is fresh. Engine cascade is unchanged: Cerebras → Gemini → SambaNova.
-BACKFILL_GEMINI_MAX = int(os.environ.get("BACKFILL_GEMINI_MAX", "120"))
+BACKFILL_GEMINI_MAX = int(os.environ.get("BACKFILL_GEMINI_MAX") or "120")
 
 # Test-mode cap: process at most LIMIT *new* articles per run (0 = no cap).
 # Set LIMIT=2 during local testing so you don't burn the daily AI quota
 # while iterating on prompt quality. e.g.  $env:LIMIT="2"
-INGEST_LIMIT = int(os.environ.get("LIMIT", "0"))
+INGEST_LIMIT = int(os.environ.get("LIMIT") or "0")
 
 # DRY_RUN=1 → fetch RSS + summarize ONLY. No Firestore reads/writes at all.
 # Results are written to dry_run_output.csv for inspection. Combine with
@@ -175,9 +175,9 @@ CEREBRAS_KEYS = [
     if _sanitize_key(k)
 ]
 CEREBRAS_API_KEY = CEREBRAS_KEYS[0] if CEREBRAS_KEYS else ""
-CEREBRAS_MODEL = os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b").strip()
+CEREBRAS_MODEL = (os.environ.get("CEREBRAS_MODEL") or "gpt-oss-120b").strip()
 CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
-CEREBRAS_CALL_DELAY_S = float(os.environ.get("CEREBRAS_CALL_DELAY_S", "1.5"))
+CEREBRAS_CALL_DELAY_S = float(os.environ.get("CEREBRAS_CALL_DELAY_S") or "1.5")
 
 # ─── SambaNova (free tier, OpenAI-compatible) — FALLBACK engine ──
 # Free tier, no card required. Llama 3.3 70B, strong multilingual.
@@ -192,9 +192,9 @@ SAMBANOVA_KEYS = [
     if _sanitize_key(k)
 ]
 SAMBANOVA_API_KEY = SAMBANOVA_KEYS[0] if SAMBANOVA_KEYS else ""
-SAMBANOVA_MODEL = os.environ.get("SAMBANOVA_MODEL", "Meta-Llama-3.3-70B-Instruct").strip()
+SAMBANOVA_MODEL = (os.environ.get("SAMBANOVA_MODEL") or "Meta-Llama-3.3-70B-Instruct").strip()
 SAMBANOVA_URL = "https://api.sambanova.ai/v1/chat/completions"
-SAMBANOVA_CALL_DELAY_S = float(os.environ.get("SAMBANOVA_CALL_DELAY_S", "2.0"))
+SAMBANOVA_CALL_DELAY_S = float(os.environ.get("SAMBANOVA_CALL_DELAY_S") or "2.0")
 
 # ─── Ollama (LOCAL model — testing only, zero API quota) ────
 # Set OLLAMA_MODEL (e.g. "qwen2.5:3b", "gemma2:2b") to route ALL polishing
