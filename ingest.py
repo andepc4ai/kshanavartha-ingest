@@ -1570,6 +1570,12 @@ def main() -> int:
                 else:
                     polished = None
 
+            # For native-rich Telugu: no AI ran, but sanitize the raw RSS text
+            # to strip junk chars (►, 🔥, ★ etc.) before storing.
+            if skip_te_rich:
+                headline_out = _sanitize_summary(headline_out)
+                summary_out = _sanitize_summary(summary_out)
+
             if DRY_RUN:
                 # No Firestore — collect for the local CSV instead.
                 dry_rows.append({
@@ -1683,7 +1689,12 @@ def main() -> int:
 
     # ─── Audio: narrate Telugu summaries → R2 (capped per run) ─
     try:
-        voiced = synthesize_pending_audio(store, AUDIO_MAX_PER_RUN)
+        # Compute the set of article IDs that will appear in feed.json so
+        # audio synthesis focuses only on feed-visible content. Articles
+        # excluded from the feed (old, over-cap, non-Telugu) are skipped.
+        feed_visible_ids = _feed_article_ids(store)
+        log.info("audio: %d feed-visible article(s) eligible for narration", len(feed_visible_ids))
+        voiced = synthesize_pending_audio(store, AUDIO_MAX_PER_RUN, feed_ids=feed_visible_ids)
         if voiced:
             log.info("audio done — narrated=%d article(s) → R2", voiced)
     except Exception as e:
@@ -1755,6 +1766,36 @@ _FEED_TIER: dict[str, int] = {
     "sports": 2, "general": 2,
     "cinema": 3,
 }
+
+
+def _feed_article_ids(store: list[dict]) -> set:
+    """Return the set of article IDs that would appear in feed.json.
+
+    Mirrors the tier/cap/ordering logic of export_feed_to_r2() without any
+    R2 call. Used to focus audio synthesis only on feed-visible articles,
+    so we don't waste gTTS quota on content the user will never see.
+    """
+    telugu = [d for d in store if _is_telugu_feed_item(d)]
+
+    def _recency(d: dict) -> str:
+        return d.get("publishedAt") or d.get("createdAt") or ""
+
+    tier0  = sorted([d for d in telugu if d.get("category") in ("politics", "schemes")],
+                    key=_recency, reverse=True)
+    tier1  = sorted([d for d in telugu if d.get("category") in ("farming", "weather", "jobs", "village")],
+                    key=_recency, reverse=True)
+    tier2  = sorted([d for d in telugu if d.get("category") in ("sports", "general")],
+                    key=_recency, reverse=True)
+    cinema = sorted([d for d in telugu if d.get("category") == "cinema"],
+                    key=_recency, reverse=True)
+
+    if POLITICS_MAX > 0: tier0  = tier0[:POLITICS_MAX]
+    if FARMING_MAX  > 0: tier1  = tier1[:FARMING_MAX]
+    if SPORTS_MAX   > 0: tier2  = tier2[:SPORTS_MAX]
+    if CINEMA_MAX   > 0: cinema = cinema[:CINEMA_MAX]
+
+    combined = (tier0 + tier1 + tier2 + cinema)[:FEED_MAX]
+    return {d["id"] for d in combined if d.get("id")}
 
 
 def export_feed_to_r2(store: list[dict]) -> None:
@@ -1987,13 +2028,18 @@ def promote_community_reports(
     return promoted
 
 
-def synthesize_pending_audio(store: list[dict], limit: int) -> int:
+def synthesize_pending_audio(store: list[dict], limit: int,
+                             feed_ids: "set | None" = None) -> int:
     """
     Narrate in-memory articles that have no audio yet (audioUrl falsy) via
     gTTS and upload the MP3 to R2, writing the public URL back onto the
     store dict. Only AI-polished articles (ai=True) are voiced — raw RSS
     text is low quality and wastes gTTS quota. Capped by `limit` so a large
     backlog fills over several cron runs. (Decision 3 — no Firestore.)
+
+    feed_ids: if provided, only articles whose ID is in this set are eligible.
+    Articles are processed newest-first so the most recent content gets audio
+    priority within the per-run cap.
     """
     import time
 
@@ -2001,8 +2047,14 @@ def synthesize_pending_audio(store: list[dict], limit: int) -> int:
         log.info("audio skipped — R2 credentials not configured")
         return 0
 
+    # Sort newest-first so the most recent feed articles get audio first.
+    def _recency(d: dict) -> str:
+        return d.get("publishedAt") or d.get("createdAt") or ""
+
+    ordered = sorted(store, key=_recency, reverse=True)
+
     candidates = skipped = done = failed = 0
-    for d in store:
+    for d in ordered:
         if done >= limit:
             break
         if d.get("audioUrl"):
@@ -2011,6 +2063,11 @@ def synthesize_pending_audio(store: list[dict], limit: int) -> int:
         # the video itself. The article's image is the video thumbnail
         # and the client renders a tap-to-embed iframe.
         if d.get("videoId"):
+            skipped += 1
+            continue
+        # Only generate audio for articles currently visible in feed.json.
+        # No point voicing content the user will never encounter.
+        if feed_ids is not None and d.get("id") not in feed_ids:
             skipped += 1
             continue
         # Only narrate AI-polished articles (ai=True). Raw RSS text is often
