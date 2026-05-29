@@ -274,11 +274,20 @@ FEEDS: list[dict[str, str]] = [
 ]
 
 CATEGORY_RULES: list[tuple[str, list[str]]] = [
-    # Order: MOST SPECIFIC first. Scheme names (e.g. "రైతు భరోసా") must run
-    # before generic farming so they don't get miscategorized as farming.
-    # When nothing matches we mark category='general' (no village fallback).
+    # ── Rule ordering rationale ──────────────────────────────────────────
+    # 1. Most-specific first: scheme names before generic farming keywords.
+    # 2. "village" moved BEFORE "politics" — a local incident story (snake,
+    #    accident, crime) that mentions "ప్రభుత్వం" or a minister in passing
+    #    should be village/general, not politics.
+    # 3. "politics" keywords tightened: removed "ప్రభుత్వం" (appears in every
+    #    Telugu news story), removed generic English "minister" and " mp "
+    #    (too many false positives). Only specific party names, leader names,
+    #    and unambiguous political terms remain.
+    # 4. Unmatched articles fall through to 'general' (no category rule for it
+    #    — it is the default return value of detect_category).
+    # ────────────────────────────────────────────────────────────────────
     ("schemes",  [
-        # Govt schemes by name (very high signal)
+        # Govt scheme names — very high signal; must run before farming/politics
         "పథకం", "భరోసా", "రైతు భరోసా", "ఆరోగ్యశ్రీ", "ఆసరా", "కల్యాణ లక్ష్మి",
         "రైతు బంధు", "రైతు భీమా", "అమ్మ ఒడి", "విద్యా దీవెన", "వసతి దీవెన",
         "పెన్షన్", "సబ్సిడీ", "దరఖాస్తు", "లబ్ధిదారు",
@@ -293,11 +302,9 @@ CATEGORY_RULES: list[tuple[str, list[str]]] = [
         "heatwave", "monsoon", "thunder",
     ]),
     ("farming",  [
-        # Telugu
         "రైతు", "వ్యవసాయ", "మామిడి", "వరి", "పత్తి", "మిర్చి", "మండి", "క్వింటాల్",
         "ధాన్యం", "పంట", "అరటి", "నిమ్మ", "చెఱకు", "మిల్లు", "డెయిరీ", "పాడి",
         "ఆక్వాకల్చర్", "రొయ్యలు", "చేప", "మత్స్య", "హార్టికల్చర్",
-        # English
         "farmer", "mandi", "crop", "paddy", "cotton", "agri", "horticulture",
         "aquaculture", "shrimp", "dairy", "harvest", "yield", "fertili",
     ]),
@@ -307,20 +314,47 @@ CATEGORY_RULES: list[tuple[str, list[str]]] = [
         "job", "recruit", "vacancy", "notification", "appsc", "tspsc", "ssc",
         "upsc", "constable", "ssb", "exam result", "interview",
     ]),
+    # ── village: BEFORE politics ─────────────────────────────────────────
+    # Local-life stories (incidents, wildlife, community events, local govt)
+    # should be village even if a politician is mentioned in passing.
+    # Added locative forms (ఊళ్లో, ఊర్లో) and community words (గ్రామస్తులు)
+    # so stories like "ఆ ఊళ్లో ప్రతి ఇంట్లో నాగుపాము" reach this rule first.
+    ("village",  [
+        # Telugu — governance
+        "గ్రామ", "మండల", "పంచాయతీ", "సర్పంచ్", "గ్రామ సచివాలయం",
+        # Telugu — local-life locative forms (catches "ఆ ఊళ్లో", "మన ఊర్లో")
+        "ఊళ్లో", "ఊర్లో", "ఊరు", "గ్రామస్తులు", "స్థానికులు", "ప్రజలు",
+        # Telugu — local incidents / human-interest
+        "నాగుపాము", "పాము", "అడవి పంది", "చిరుత", "భల్లూకం",   # wildlife
+        "ప్రమాదం", "రోడ్డు ప్రమాదం", "మృతి", "గాయాలు",           # accidents
+        "అగ్నిప్రమాదం", "మంటలు",                                   # fire
+        "దొంగతనం", "దోపిడీ", "హత్య",                               # crime
+        "ఆసుపత్రి", "వైద్యం",                                       # health
+        # English
+        "village", "panchayat", "gram", "sarpanch", "ward sachivalayam",
+        "accident", "fire", "snake", "theft", "hospital",
+    ]),
+    # ── politics: strong signals only ───────────────────────────────────
+    # REMOVED: "ప్రభుత్వం" (govt — appears in every news story, too broad)
+    # REMOVED: "minister" (English generic — fires on any minister visit/event)
+    # REMOVED: " mp " (fires on English words like "camp", "stamp", "example")
+    # KEPT: specific party names, leader names, election/legislative terms.
     ("politics", [
-        # Telugu — leaders, parties, institutions
-        "పార్టీ", "ఎమ్మెల్యే", "ఎంపీ", "ఎంఎల్‌సీ", "సీఎం", "మంత్రి", "ముఖ్యమంత్రి",
-        "ఎన్నికలు", "ఓటర్", "ఎన్నికల కమిషన్", "ప్రభుత్వం",
+        # Telugu — specific leaders
         "చంద్రబాబు", "నారా లోకేష్", "పవన్ కల్యాణ్", "జగన్", "వైఎస్", "షర్మిల",
         "రేవంత్ రెడ్డి", "కేటీఆర్", "కేసీఆర్", "మోదీ", "రాహుల్", "షా",
         "భూమన", "పెద్దిరెడ్డి", "బొత్స", "విజయసాయి", "హరిరామ", "నారాయణ",
+        # Telugu — parties and unambiguous political roles
+        "పార్టీ", "ఎమ్మెల్యే", "ఎంపీ", "ఎంఎల్‌సీ", "సీఎం", "ముఖ్యమంత్రి",
+        "ఎన్నికలు", "ఓటర్", "ఎన్నికల కమిషన్", "మంత్రి",
         "టీడీపీ", "వైసీపీ", "వైఎస్సార్సీపీ", "జనసేన", "బీఆర్‌ఎస్", "బీజేపీ", "కాంగ్రెస్",
-        # English
+        # English — specific names and parties only
         "tdp", "ysrcp", "ysr", "bjp", "congress", "brs", "jana sena", "janasena",
         "naidu", "lokesh", "jagan", "sharmila", "pawan kalyan", "revanth",
         "ktr", "kcr", "modi", "rahul", "amit shah",
-        "cm ", " mla", " mp ", "minister", "election", "eci", "assembly",
-        "parliament", "legisla", "cabinet", "governor",
+        # English — unambiguous political terms (not generic)
+        "cm ", " mla", "election", "eci",
+        "parliament", "legisla", "cabinet", "governor", "assembly session",
     ]),
     ("sports",   [
         "క్రికెట్", "క్రీడ", "మ్యాచ్", "టోర్నీ", "ఐపీఎల్",
@@ -334,11 +368,6 @@ CATEGORY_RULES: list[tuple[str, list[str]]] = [
         "movie", "cinema", "film", "tollywood", "box office", "trailer",
         "teaser", "ott", "review", "first look", "actor", "actress",
         "director", "song release", "pre-release",
-    ]),
-    # "village" only fires for explicit local-governance keywords. Otherwise → 'general'.
-    ("village",  [
-        "గ్రామ ", "మండల ", "పంచాయతీ", "సర్పంచ్", "గ్రామ సచివాలయం",
-        "village", "panchayat", "gram", "sarpanch", "ward sachivalayam",
     ]),
 ]
 
