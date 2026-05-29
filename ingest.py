@@ -113,7 +113,8 @@ DELETE_BATCH_SIZE = 400     # Firestore batch limit is 500 — keep headroom
 # articles get narrated per run so a 250-article backlog spreads over a
 # few cron cycles instead of one slow run.
 AUDIO_MAX_PER_RUN = int(os.environ.get("AUDIO_MAX_PER_RUN") or "30")
-FEED_MAX = int(os.environ.get("FEED_MAX") or "500")    # public feed.json size cap
+FEED_MAX = int(os.environ.get("FEED_MAX") or "500")    # public feed.json size cap (hard ceiling)
+FEED_MIN = int(os.environ.get("FEED_MIN") or "250")    # minimum articles to publish; overflow fills the gap
 # Cinema is capped independently so it never crowds out politics/farming.
 # Tune with CINEMA_MAX env var; 0 = no cap (not recommended).
 CINEMA_MAX = int(os.environ.get("CINEMA_MAX") or "8")
@@ -647,33 +648,63 @@ SUMMARY_PROMPT = (
     "నియమాలు: తటస్థ, వాస్తవిక భాష. వార్త సానుకూలమా/ప్రతికూలమా అని "
     "ముద్ర వేయవద్దు, మీ అభిప్రాయం రాయవద్దు. పునరావృతం, నింపుడు మాటలు, "
     "మూలంలో లేని నేపథ్యం వద్దు. TITLE, BODY రెండూ తెలుగులోనే; "
-    "బుల్లెట్‌లు/నంబర్‌లు వద్దు (వచనం మాత్రమే). TITLE:, BODY: ట్యాగ్‌లు "
-    "ఇంగ్లీష్‌లోనే ఉంచండి.\n\n"
+    "బుల్లెట్‌లు/నంబర్‌లు వద్దు (వచనం మాత్రమే). TITLE:, BODY:, CATEGORY: "
+    "ట్యాగ్‌లు ఇంగ్లీష్‌లోనే ఉంచండి.\n"
+    "CATEGORY: వార్త విషయాన్ని బట్టి ఒక్క వర్గం మాత్రమే ఎంచుకోండి: "
+    "politics (రాజకీయాలు, నేతలు, పార్టీలు, ఎన్నికలు) | "
+    "farming (వ్యవసాయం, రైతులు, పంటలు, మండీ ధరలు) | "
+    "weather (వాతావరణం, వర్షం, తుఫాన్) | "
+    "jobs (ఉద్యోగాలు, నోటిఫికేషన్లు, పరీక్షలు) | "
+    "village (గ్రామాలు, స్థానిక సంఘటనలు, ప్రమాదాలు, నేరాలు) | "
+    "sports (క్రీడలు, క్రికెట్) | "
+    "cinema (సినిమా, నటులు, చిత్రాలు) | "
+    "schemes (ప్రభుత్వ పథకాలు, సబ్సిడీలు, పెన్షన్లు) | "
+    "general (వేరే ఏ వర్గంలోనూ సరిగా సరిపోకపోతే)\n\n"
     "శీర్షిక: {headline}\nమూల వచనం: {summary}"
 )
 
+# Valid category values the AI may return — must match CATEGORY_RULES keys + general.
+_AI_VALID_CATEGORIES = frozenset({
+    "politics", "farming", "weather", "jobs", "village",
+    "sports", "cinema", "schemes", "general",
+})
 
-def _split_polished(raw: str) -> tuple[str | None, str]:
+
+def _split_polished(raw: str) -> tuple[str | None, str, str | None]:
     """
-    Parse the TITLE:/BODY: structured polish output.
-    Returns (telugu_headline_or_None, summary). Falls back gracefully:
-    if no tags found, the whole text is the summary and headline is None.
+    Parse the TITLE:/BODY:/CATEGORY: structured polish output.
+    Returns (telugu_headline_or_None, summary, ai_category_or_None).
+
+    ai_category is only set when the model returns a recognised category
+    token from _AI_VALID_CATEGORIES. Callers should use it to override the
+    keyword-detected category but fall back to keyword rules when it is None
+    or unrecognised.
+
+    Falls back gracefully: if no tags found, the whole text is the summary,
+    headline and category are None.
     """
     if not raw:
-        return None, ""
+        return None, "", None
     title = None
     body_parts: list[str] = []
+    ai_category: str | None = None
     mode = None
     for line in raw.splitlines():
         s = line.strip()
         if not s:
             continue
-        if s.upper().startswith("TITLE:"):
+        su = s.upper()
+        if su.startswith("TITLE:"):
             title = s[6:].strip().strip("\"'").strip()
             mode = "t"
-        elif s.upper().startswith("BODY:"):
+        elif su.startswith("BODY:"):
             body_parts.append(s[5:].strip())
             mode = "b"
+        elif su.startswith("CATEGORY:"):
+            cat = s[9:].strip().lower().strip("\"'").strip()
+            if cat in _AI_VALID_CATEGORIES:
+                ai_category = cat
+            mode = "c"
         elif mode == "b":
             body_parts.append(s)
         elif mode == "t" and not title:
@@ -681,7 +712,7 @@ def _split_polished(raw: str) -> tuple[str | None, str]:
     body = " ".join(p for p in body_parts if p).strip().strip("\"'").strip()
     if not body and not title:
         # Model ignored the format — treat the whole thing as the summary.
-        return None, _sanitize_summary(raw.strip().strip("\"'").strip())
+        return None, _sanitize_summary(raw.strip().strip("\"'").strip()), None
     if not body:
         body = raw.strip()
     # Truncation guard: if the model ran out of tokens, BODY ends mid-sentence.
@@ -695,7 +726,7 @@ def _split_polished(raw: str) -> tuple[str | None, str]:
     # junk characters (►/🔥/etc.) that were in the source description.
     body = _sanitize_summary(body)
     title = _sanitize_summary(title) if title else title
-    return (title or None), body
+    return (title or None), body, ai_category
 
 
 def _looks_english(s: str) -> bool:
@@ -1595,13 +1626,18 @@ def main() -> int:
                     pool, a.headline, a.summary, counters, MAX_TOTAL_GEMINI
                 )
                 if polished and len(polished) > 20:
-                    p_title, p_body = _split_polished(polished)
+                    p_title, p_body, p_cat = _split_polished(polished)
                     if p_body:
                         summary_out = p_body
                     # Use the translated headline when the original is English
                     # (or always, if we got a clean Telugu title).
                     if p_title and (a.lang == "en" or _looks_english(a.headline)):
                         headline_out = p_title
+                    # Use AI category if the model returned a valid one.
+                    # AI sees the full article context so its judgment is more
+                    # accurate than keyword rules on raw RSS text.
+                    if p_cat:
+                        category = p_cat
                     summarized += 1
                 else:
                     polished = None
@@ -1804,33 +1840,80 @@ _FEED_TIER: dict[str, int] = {
 }
 
 
-def _feed_article_ids(store: list[dict]) -> set:
-    """Return the set of article IDs that would appear in feed.json.
+def _build_feed_combined(store: list[dict]) -> tuple[list[dict], dict]:
+    """Core feed-selection logic shared by export_feed_to_r2() and _feed_article_ids().
 
-    Mirrors the tier/cap/ordering logic of export_feed_to_r2() without any
-    R2 call. Used to focus audio synthesis only on feed-visible articles,
-    so we don't waste gTTS quota on content the user will never see.
+    Returns (combined_list, stats_dict).
+
+    Algorithm:
+      1. Filter to Telugu-readable articles only.
+      2. Sort each tier newest-first and apply per-tier caps so no single
+         category monopolises the feed.
+      3. If the capped total is below FEED_MIN, fill the gap from overflow
+         articles (uncapped, in tier priority order) so we always publish at
+         least FEED_MIN articles when enough content exists.
+      4. Hard-cap the final list at FEED_MAX.
     """
     telugu = [d for d in store if _is_telugu_feed_item(d)]
 
     def _recency(d: dict) -> str:
         return d.get("publishedAt") or d.get("createdAt") or ""
 
-    tier0  = sorted([d for d in telugu if d.get("category") in ("politics", "schemes")],
-                    key=_recency, reverse=True)
-    tier1  = sorted([d for d in telugu if d.get("category") in ("farming", "weather", "jobs", "village")],
-                    key=_recency, reverse=True)
-    tier2  = sorted([d for d in telugu if d.get("category") in ("sports", "general")],
-                    key=_recency, reverse=True)
-    cinema = sorted([d for d in telugu if d.get("category") == "cinema"],
-                    key=_recency, reverse=True)
+    # Build uncapped tier lists (needed later for overflow fill).
+    tier0_all = sorted([d for d in telugu if d.get("category") in ("politics", "schemes")],
+                       key=_recency, reverse=True)
+    tier1_all = sorted([d for d in telugu if d.get("category") in ("farming", "weather", "jobs", "village")],
+                       key=_recency, reverse=True)
+    tier2_all = sorted([d for d in telugu if d.get("category") in ("sports", "general")],
+                       key=_recency, reverse=True)
+    cinema_all = sorted([d for d in telugu if d.get("category") == "cinema"],
+                        key=_recency, reverse=True)
 
-    if POLITICS_MAX > 0: tier0  = tier0[:POLITICS_MAX]
-    if FARMING_MAX  > 0: tier1  = tier1[:FARMING_MAX]
-    if SPORTS_MAX   > 0: tier2  = tier2[:SPORTS_MAX]
-    if CINEMA_MAX   > 0: cinema = cinema[:CINEMA_MAX]
+    # Apply per-tier caps.
+    tier0  = tier0_all[:POLITICS_MAX]  if POLITICS_MAX > 0 else tier0_all
+    tier1  = tier1_all[:FARMING_MAX]   if FARMING_MAX  > 0 else tier1_all
+    tier2  = tier2_all[:SPORTS_MAX]    if SPORTS_MAX   > 0 else tier2_all
+    cinema = cinema_all[:CINEMA_MAX]   if CINEMA_MAX   > 0 else cinema_all
 
-    combined = (tier0 + tier1 + tier2 + cinema)[:FEED_MAX]
+    combined = tier0 + tier1 + tier2 + cinema
+
+    # ── FEED_MIN fill ────────────────────────────────────────────────────
+    # If tier caps produced fewer articles than FEED_MIN (e.g. only politics
+    # articles exist in the store so farming/sports buckets are empty), pull
+    # overflow from the uncapped lists in tier-priority order to top up.
+    # This ensures the app always has at least FEED_MIN articles to show.
+    target = min(FEED_MIN, FEED_MAX)
+    if FEED_MIN > 0 and len(combined) < target:
+        combined_ids = {d["id"] for d in combined}
+        overflow = [
+            d for d in (tier0_all + tier1_all + tier2_all + cinema_all)
+            if d["id"] not in combined_ids
+        ]
+        needed = target - len(combined)
+        combined = combined + overflow[:needed]
+        if overflow[:needed]:
+            log.info(
+                "feed: below FEED_MIN=%d — added %d overflow article(s) to reach %d",
+                FEED_MIN, min(needed, len(overflow)), len(combined),
+            )
+
+    combined = combined[:FEED_MAX]
+
+    stats = {
+        "tier0": len(tier0), "tier1": len(tier1),
+        "tier2": len(tier2), "cinema": len(cinema),
+        "skipped_non_te": len(store) - len(telugu),
+    }
+    return combined, stats
+
+
+def _feed_article_ids(store: list[dict]) -> set:
+    """Return the set of article IDs that would appear in feed.json.
+
+    Uses _build_feed_combined() so audio synthesis targets exactly the same
+    articles that will be published. No R2 call.
+    """
+    combined, _ = _build_feed_combined(store)
     return {d["id"] for d in combined if d.get("id")}
 
 
@@ -1855,51 +1938,18 @@ def export_feed_to_r2(store: list[dict]) -> None:
         log.info("feed export skipped — R2 not configured")
         return
 
-    telugu = [d for d in store if _is_telugu_feed_item(d)]
-    skipped_non_te = len(store) - len(telugu)
-
-    def _recency(d: dict) -> str:
-        """ISO 8601 strings sort lexicographically = chronologically."""
-        return d.get("publishedAt") or d.get("createdAt") or ""
-
-    # Split into 4 tier buckets, each sorted newest-first.
-    tier0  = sorted(
-        [d for d in telugu if d.get("category") in ("politics", "schemes")],
-        key=_recency, reverse=True,
-    )
-    tier1  = sorted(
-        [d for d in telugu if d.get("category") in ("farming", "weather", "jobs", "village")],
-        key=_recency, reverse=True,
-    )
-    tier2  = sorted(
-        [d for d in telugu if d.get("category") in ("sports", "general")],
-        key=_recency, reverse=True,
-    )
-    cinema = sorted(
-        [d for d in telugu if d.get("category") == "cinema"],
-        key=_recency, reverse=True,
-    )
-
-    # Apply per-tier caps so no single category monopolises all FEED_MAX slots.
-    # POLITICS_MAX/FARMING_MAX/SPORTS_MAX/CINEMA_MAX = 0 means no cap.
-    if POLITICS_MAX > 0: tier0  = tier0[:POLITICS_MAX]
-    if FARMING_MAX  > 0: tier1  = tier1[:FARMING_MAX]
-    if SPORTS_MAX   > 0: tier2  = tier2[:SPORTS_MAX]
-    if CINEMA_MAX   > 0: cinema = cinema[:CINEMA_MAX]
-
-    # Combine in tier order then cap the total feed size.
-    combined = (tier0 + tier1 + tier2 + cinema)[:FEED_MAX]
+    combined, stats = _build_feed_combined(store)
 
     log.info(
         "feed: %d articles -> R2  "
         "[politics/schemes=%d(cap=%d)  farming/etc=%d(cap=%d)  "
         "sports/general=%d(cap=%d)  cinema=%d(cap=%d)]  non-Telugu excluded=%d",
         len(combined),
-        len(tier0),  POLITICS_MAX,
-        len(tier1),  FARMING_MAX,
-        len(tier2),  SPORTS_MAX,
-        len(cinema), CINEMA_MAX,
-        skipped_non_te,
+        stats["tier0"],  POLITICS_MAX,
+        stats["tier1"],  FARMING_MAX,
+        stats["tier2"],  SPORTS_MAX,
+        stats["cinema"], CINEMA_MAX,
+        stats["skipped_non_te"],
     )
 
     out: list[dict] = []
@@ -1936,7 +1986,7 @@ def export_feed_to_r2(store: list[dict]) -> None:
             "sponsoredAdvertiser": d.get("sponsoredAdvertiser") or "",
         })
     log.info("feed: %d Telugu articles published, %d non-Telugu excluded",
-             len(out), skipped_non_te)
+             len(out), stats["skipped_non_te"])
     feed_r2.upload_feed(out)
 
 
@@ -1967,13 +2017,16 @@ def backfill_unpolished(store: list[dict], pool: GeminiKeyPool, counters: dict[s
             log.warning("backfill: all engines down, stopping at %d", polished_count)
             break
         if polished and len(polished) > 20:
-            p_title, p_body = _split_polished(polished)
+            p_title, p_body, p_cat = _split_polished(polished)
             body = p_body or polished
             d["ai"] = True
             d["summary"] = body
             d["audioScript"] = body
             if p_title and _looks_english(headline):
                 d["headline"] = p_title
+            if p_cat:
+                d["category"] = p_cat
+                d["color"] = COLOR_BY_CAT.get(p_cat, d.get("color", "#7C2D12"))
             polished_count += 1
     return polished_count
 
@@ -2014,7 +2067,7 @@ def promote_community_reports(
                 pool, headline, detail, counters, MAX_TOTAL_GEMINI
             )
             if polished and len(polished) > 20:
-                p_title, p_body = _split_polished(polished)
+                p_title, p_body, p_cat = _split_polished(polished)
                 if p_body:
                     te_body = p_body
                 if p_title:
