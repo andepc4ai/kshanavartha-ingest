@@ -767,7 +767,7 @@ def sambanova_summarize(headline: str, raw_summary: str) -> str | None:
             {"role": "user", "content": SUMMARY_PROMPT.format(headline=headline, summary=raw_summary)},
         ],
         "temperature": 0.3,
-        "max_tokens": 450,
+        "max_tokens": 600,
     }
     while True:
         key = sambanova_pool.current()
@@ -812,7 +812,12 @@ def cerebras_summarize(headline: str, raw_summary: str) -> str | None:
             {"role": "user", "content": SUMMARY_PROMPT.format(headline=headline, summary=raw_summary)},
         ],
         "temperature": 0.3,
-        "max_tokens": 450,
+        # gpt-oss-120b is a thinking model: internal reasoning tokens count
+        # toward max_tokens BEFORE the visible answer is written.  450 was
+        # enough to exhaust the budget on chain-of-thought → finish_reason=length
+        # with no output.  1200 gives ~600 tokens of reasoning room + ~600 for
+        # the actual Telugu headline + 2–3 sentence summary.
+        "max_tokens": 1200,
     }
     while True:
         key = cerebras_pool.current()
