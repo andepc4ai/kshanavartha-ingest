@@ -3,6 +3,9 @@ run-local.ps1
 run-local.env
 *.env
 .env.*
+service-account.json
+*-service-account.json
+*-credentials.json
 
 # Python artefacts
 __pycache__/
