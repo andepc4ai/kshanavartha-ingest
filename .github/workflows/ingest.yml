@@ -1,12 +1,22 @@
 name: KshanaVartha — RSS Ingest (Public)
 
 on:
-  schedule:
-    # Every 30 minutes. Public repos get unlimited free GitHub Actions minutes.
-    # 48 runs/day keeps articles fresh without hammering AI free-tier RPD
-    # (dedup ensures each article is polished at most once across all runs).
-    - cron: "*/30 * * * *"
-  workflow_dispatch: {}   # manual trigger from the Actions tab
+  # ── Scheduling note ────────────────────────────────────────────────────────
+  # GitHub's built-in schedule trigger is unreliable on low-activity public
+  # repos — it silently delays or skips runs. We use cron-job.org (free) to
+  # POST to the GitHub workflow_dispatch API every 30 minutes instead:
+  #
+  #   URL:    https://api.github.com/repos/andepc4ai/kshanavartha-ingest/actions/workflows/ingest.yml/dispatches
+  #   Method: POST
+  #   Headers: Authorization: Bearer <classic PAT with 'workflow' scope>
+  #            Accept: application/vnd.github+json
+  #            Content-Type: application/json
+  #   Body:   {"ref": "main"}
+  #
+  # This gives reliable 30-min cadence (48 runs/day) without burning GitHub
+  # Actions cron quota. Manual trigger from the Actions tab also works.
+  # ──────────────────────────────────────────────────────────────────────────
+  workflow_dispatch: {}   # triggered by cron-job.org every 30 min + manual
 
 concurrency:
   group: kv-ingest
