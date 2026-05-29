@@ -117,6 +117,13 @@ FEED_MAX = int(os.environ.get("FEED_MAX") or "500")    # public feed.json size c
 # Cinema is capped independently so it never crowds out politics/farming.
 # Tune with CINEMA_MAX env var; 0 = no cap (not recommended).
 CINEMA_MAX = int(os.environ.get("CINEMA_MAX") or "8")
+# Per-tier feed caps so no single category monopolises all 500 feed slots.
+# Politics articles can easily fill the entire feed (AP/TG news is ~60%
+# political). Setting POLITICS_MAX=150 leaves room for farming/weather/sports.
+# 0 = no cap per tier (not recommended — politics will crowd everything out).
+POLITICS_MAX = int(os.environ.get("POLITICS_MAX") or "150")
+FARMING_MAX  = int(os.environ.get("FARMING_MAX")  or "150")
+SPORTS_MAX   = int(os.environ.get("SPORTS_MAX")   or "150")
 # Minimum hours between push notifications. Set via NOTIFICATION_GAP_HOURS
 # GitHub Variable. Default 3 h → max 8 pushes/day even on a fast news day.
 NOTIFICATION_GAP_HOURS = int(os.environ.get("NOTIFICATION_GAP_HOURS") or "3")
@@ -829,13 +836,21 @@ def cerebras_summarize(headline: str, raw_summary: str) -> str | None:
         if not r.ok:
             log.warning("cerebras http %d: %s", r.status_code, r.text[:160])
             return None
-        try:
-            data = r.json()
-            text = data["choices"][0]["message"]["content"]
-            return text.strip().strip("\"'") if text else None
-        except Exception as e:
-            log.warning("cerebras parse failed: %s", e)
+        data = r.json()
+        choices = data.get("choices") or []
+        if not choices:
+            log.warning("cerebras no choices: %s", str(data)[:300])
             return None
+        msg = choices[0].get("message") or {}
+        # gpt-oss-120b is a thinking model — may return content=None with
+        # reasoning_content populated. Try content first, fall back to
+        # reasoning_content so we don't silently discard valid output.
+        text = msg.get("content") or msg.get("reasoning_content") or ""
+        if not text:
+            finish = choices[0].get("finish_reason", "?")
+            log.warning("cerebras empty content (finish_reason=%s) — skipping article", finish)
+            return None
+        return text.strip().strip("\"'")
 
 
 def ollama_summarize(headline: str, raw_summary: str) -> str | None:
@@ -1532,6 +1547,9 @@ def main() -> int:
             # (≥60 Telugu words). Native feeds like Sakshi/BBC Telugu/NTV often
             # provide 80-120 word descriptions — polishing them wastes quota and
             # rarely improves quality for already-fluent Telugu content.
+            # IMPORTANT: these articles are marked ai=True below even though
+            # no AI ran — the content is already publication-quality Telugu,
+            # so they deserve audio narration and full feed treatment.
             skip_te_rich = (a.lang == "te") and (_te_word_count(a.summary) >= 60)
             # YouTube items: headline + description are already the publisher's
             # own copy; no value in AI-rewriting it. Saves quota.
@@ -1586,7 +1604,12 @@ def main() -> int:
                 "audioSec": a.audio_sec,
                 "color": a.color,
                 "shares": 0,
-                "ai": bool(polished),
+                # ai=True if AI polished the text, OR if the source already
+                # delivered publication-quality native Telugu (skip_te_rich).
+                # Both cases earn audio narration + full feed treatment.
+                # skip_video and skip_english stay ai=False — they need
+                # translation or are just video embeds.
+                "ai": bool(polished) or skip_te_rich,
                 "lang": a.lang,
                 "image": a.image,
                 "body": a.body,
@@ -1758,36 +1781,47 @@ def export_feed_to_r2(store: list[dict]) -> None:
     telugu = [d for d in store if _is_telugu_feed_item(d)]
     skipped_non_te = len(store) - len(telugu)
 
-    # Separate cinema so it can be capped and always appended last.
-    cinema    = [d for d in telugu if d.get("category") == "cinema"]
-    non_cinema = [d for d in telugu if d.get("category") != "cinema"]
-
     def _recency(d: dict) -> str:
         """ISO 8601 strings sort lexicographically = chronologically."""
         return d.get("publishedAt") or d.get("createdAt") or ""
 
-    # Pass 1: recency desc (newest first).
-    non_cinema.sort(key=_recency, reverse=True)
-    cinema.sort(key=_recency, reverse=True)
+    # Split into 4 tier buckets, each sorted newest-first.
+    tier0  = sorted(
+        [d for d in telugu if d.get("category") in ("politics", "schemes")],
+        key=_recency, reverse=True,
+    )
+    tier1  = sorted(
+        [d for d in telugu if d.get("category") in ("farming", "weather", "jobs", "village")],
+        key=_recency, reverse=True,
+    )
+    tier2  = sorted(
+        [d for d in telugu if d.get("category") in ("sports", "general")],
+        key=_recency, reverse=True,
+    )
+    cinema = sorted(
+        [d for d in telugu if d.get("category") == "cinema"],
+        key=_recency, reverse=True,
+    )
 
-    # Pass 2: stable tier sort on non-cinema (preserves recency within tier).
-    non_cinema.sort(key=lambda d: _FEED_TIER.get(d.get("category", "general"), 2))
+    # Apply per-tier caps so no single category monopolises all FEED_MAX slots.
+    # POLITICS_MAX/FARMING_MAX/SPORTS_MAX/CINEMA_MAX = 0 means no cap.
+    if POLITICS_MAX > 0: tier0  = tier0[:POLITICS_MAX]
+    if FARMING_MAX  > 0: tier1  = tier1[:FARMING_MAX]
+    if SPORTS_MAX   > 0: tier2  = tier2[:SPORTS_MAX]
+    if CINEMA_MAX   > 0: cinema = cinema[:CINEMA_MAX]
 
-    # Cap cinema (CINEMA_MAX=0 means no cap).
-    if CINEMA_MAX > 0:
-        cinema = cinema[:CINEMA_MAX]
-
-    combined = (non_cinema + cinema)[:FEED_MAX]
+    # Combine in tier order then cap the total feed size.
+    combined = (tier0 + tier1 + tier2 + cinema)[:FEED_MAX]
 
     log.info(
-        "feed: %d articles -> R2  [politics/schemes=%d  farming/etc=%d  "
-        "sports/general=%d  cinema=%d (cap=%d)]  non-Telugu excluded=%d",
+        "feed: %d articles -> R2  "
+        "[politics/schemes=%d(cap=%d)  farming/etc=%d(cap=%d)  "
+        "sports/general=%d(cap=%d)  cinema=%d(cap=%d)]  non-Telugu excluded=%d",
         len(combined),
-        sum(1 for d in combined if d.get("category") in ("politics", "schemes")),
-        sum(1 for d in combined if d.get("category") in ("farming", "weather", "jobs", "village")),
-        sum(1 for d in combined if d.get("category") in ("sports", "general")),
-        sum(1 for d in combined if d.get("category") == "cinema"),
-        CINEMA_MAX,
+        len(tier0),  POLITICS_MAX,
+        len(tier1),  FARMING_MAX,
+        len(tier2),  SPORTS_MAX,
+        len(cinema), CINEMA_MAX,
         skipped_non_te,
     )
 

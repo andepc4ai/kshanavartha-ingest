@@ -65,6 +65,9 @@ jobs:
           AUDIO_MAX_PER_RUN: ${{ vars.AUDIO_MAX_PER_RUN }}
           FEED_MAX: ${{ vars.FEED_MAX }}
           CINEMA_MAX: ${{ vars.CINEMA_MAX }}
+          POLITICS_MAX: ${{ vars.POLITICS_MAX }}
+          FARMING_MAX: ${{ vars.FARMING_MAX }}
+          SPORTS_MAX: ${{ vars.SPORTS_MAX }}
           NOTIFICATION_GAP_HOURS: ${{ vars.NOTIFICATION_GAP_HOURS }}
           CEREBRAS_CALL_DELAY_S: ${{ vars.CEREBRAS_CALL_DELAY_S }}
           SAMBANOVA_CALL_DELAY_S: ${{ vars.SAMBANOVA_CALL_DELAY_S }}
