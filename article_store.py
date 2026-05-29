@@ -102,21 +102,71 @@ def load_articles() -> list[dict]:
 
 def save_articles(articles: list[dict]) -> bool:
     """
-    Persist the full working set. Returns True on success. Refuses to
-    overwrite with an empty list (a load glitch must never nuke the set);
-    callers that legitimately want to clear must pass force via env.
+    Persist the full working set with merge-on-drift protection.
+
+    Before writing, re-fetches the current R2 state and merges any articles
+    that were added by a concurrent run (e.g. GitHub Actions cron firing
+    while a local manual run was in progress). This prevents the classic
+    read-modify-write race condition where two processes load the same
+    snapshot, work independently, and the last writer silently discards
+    the other's new articles.
+
+    Merge strategy (by article ID):
+      • Articles in OUR store    → use our version (preserves audioUrl
+                                   updates, AI polish, etc.)
+      • Articles in R2 but NOT   → preserve as-is (added by the concurrent
+        in our store               run while we were processing)
+
+    If R2 has >50 more articles than us, that means our load was stale
+    (not just a small concurrent race) — we log a WARNING so the operator
+    knows something unusual happened.
+
+    Only applies in R2 mode. Local KV_LOCAL_STORE test mode skips the
+    merge (no concurrency concern in offline tests).
     """
     if not articles and os.environ.get("KV_ALLOW_EMPTY_STORE") != "1":
         log.warning("article_store: refusing to save empty set "
                     "(set KV_ALLOW_EMPTY_STORE=1 to override)")
         return False
+
+    local = _local_path()   # resolved once; used by merge block + write block
+
+    # ── Merge-on-drift safeguard (R2 mode only) ───────────────────────────
+    if not local and _r2_enabled():
+        try:
+            r2_current = load_articles()
+            r2_count   = len(r2_current)
+            our_count  = len(articles)
+            our_ids    = {a["id"] for a in articles}
+            # Articles added to R2 while we were running (concurrent write)
+            r2_only    = [a for a in r2_current if a["id"] not in our_ids]
+            if r2_only:
+                articles = articles + r2_only   # our updates win; R2-only preserved
+                if r2_count > our_count + 50:
+                    # Big drift → stale load, not just a small race
+                    log.warning(
+                        "article_store: STALE LOAD detected — "
+                        "R2 had %d articles, we loaded %d. "
+                        "Merged +%d R2-only article(s) → saving %d total. "
+                        "Tip: avoid running local ingest while GitHub Actions cron is active.",
+                        r2_count, our_count, len(r2_only), len(articles),
+                    )
+                else:
+                    log.info(
+                        "article_store: merged %d article(s) from concurrent run "
+                        "(R2=%d our=%d) → %d total",
+                        len(r2_only), r2_count, our_count, len(articles),
+                    )
+        except Exception as e:
+            log.warning("article_store: merge-check failed (%s) — saving as-is", e)
+    # ─────────────────────────────────────────────────────────────────────
+
     payload = json.dumps(
         {"articles": articles, "count": len(articles)},
         ensure_ascii=False, separators=(",", ":"),
     ).encode("utf-8")
 
-    local = _local_path()
-    if local:
+    if local:  # set above in the merge block (or "" in R2 mode)
         try:
             with open(local, "w", encoding="utf-8") as fh:
                 fh.write(payload.decode("utf-8"))

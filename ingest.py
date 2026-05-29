@@ -117,13 +117,15 @@ FEED_MAX = int(os.environ.get("FEED_MAX") or "500")    # public feed.json size c
 # Cinema is capped independently so it never crowds out politics/farming.
 # Tune with CINEMA_MAX env var; 0 = no cap (not recommended).
 CINEMA_MAX = int(os.environ.get("CINEMA_MAX") or "8")
-# Per-tier feed caps so no single category monopolises all 500 feed slots.
+# Per-tier feed caps so no single category monopolises feed slots.
 # Politics articles can easily fill the entire feed (AP/TG news is ~60%
-# political). Setting POLITICS_MAX=150 leaves room for farming/weather/sports.
+# political). Caps keep the feed balanced across categories while staying
+# small enough that feed.json downloads fast on mobile (75×3+8 ≈ 230 articles
+# ≈ 600 KB vs 450 articles ≈ 1.4 MB at the old 150 default).
 # 0 = no cap per tier (not recommended — politics will crowd everything out).
-POLITICS_MAX = int(os.environ.get("POLITICS_MAX") or "150")
-FARMING_MAX  = int(os.environ.get("FARMING_MAX")  or "150")
-SPORTS_MAX   = int(os.environ.get("SPORTS_MAX")   or "150")
+POLITICS_MAX = int(os.environ.get("POLITICS_MAX") or "75")
+FARMING_MAX  = int(os.environ.get("FARMING_MAX")  or "75")
+SPORTS_MAX   = int(os.environ.get("SPORTS_MAX")   or "75")
 # Minimum hours between push notifications. Set via NOTIFICATION_GAP_HOURS
 # GitHub Variable. Default 3 h → max 8 pushes/day even on a fast news day.
 NOTIFICATION_GAP_HOURS = int(os.environ.get("NOTIFICATION_GAP_HOURS") or "3")
@@ -1877,7 +1879,9 @@ def export_feed_to_r2(store: list[dict]) -> None:
             "id": d.get("id", ""),
             "headline": d.get("headline", ""),
             "summary": d.get("summary", ""),
-            "audioScript": d.get("audioScript", ""),
+            # audioScript removed — identical to summary; app plays audioUrl MP3
+            # lang removed     — feed is always Telugu; app has no lang display logic
+            # createdAt removed — app never displays it; only used as ingest sort fallback
             "category": d.get("category", "general"),
             "mandal": d.get("mandal", "all"),
             "village": d.get("village", ""),
@@ -1887,10 +1891,8 @@ def export_feed_to_r2(store: list[dict]) -> None:
             "audioUrl": d.get("audioUrl"),
             "audioSec": d.get("audioSec", 60),
             "color": d.get("color", "#7C2D12"),
-            "lang": d.get("lang", "te"),
             "ai": bool(d.get("ai", False)),
             "publishedAt": d.get("publishedAt"),
-            "createdAt": d.get("createdAt"),
             "videoId": d.get("videoId"),
             "isShort": bool(d.get("isShort")),
             # Editorial + sponsored fields. The client renders featured
