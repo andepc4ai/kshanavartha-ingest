@@ -1649,23 +1649,17 @@ def main() -> int:
                     # (or always, if we got a clean Telugu title).
                     if p_title and (a.lang == "en" or _looks_english(a.headline)):
                         headline_out = p_title
-                    # Category resolution — three passes, most-reliable first:
-                    # 1. Keyword detection on the AI-generated Telugu headline.
-                    #    This is the cleanest signal: short, Telugu-only, no
-                    #    political noise from the raw RSS body.
-                    # 2. AI-returned category — only accepted when both keyword
-                    #    passes returned "general" (no strong signal found).
-                    #    AI is NOT allowed to override a confident keyword match
-                    #    (e.g. cinema → politics) because AI often mis-classifies
-                    #    when the article body contains incidental political names.
+                    # Category resolution — keyword detection on the AI-generated
+                    # Telugu headline is the most reliable signal: short, clean
+                    # Telugu, free of political noise from the raw RSS body.
+                    # AI's own category string (p_cat) is NOT used — it
+                    # mis-classifies too often (cinema/finance → politics).
+                    # If nothing matches → stays "general". Better to under-
+                    # classify than to put cinema or finance under politics.
                     if p_title:
                         ai_headline_cat = detect_category(p_title)
                         if ai_headline_cat != "general":
                             category = ai_headline_cat  # clean headline wins
-                        elif p_cat and category == "general":
-                            category = p_cat            # AI helps when both passes uncertain
-                    elif p_cat and category == "general":
-                        category = p_cat                # no AI headline — fall back to AI cat
                     summarized += 1
                 else:
                     polished = None
