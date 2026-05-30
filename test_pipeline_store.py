@@ -30,9 +30,9 @@ now = datetime.now(timezone.utc)
 iso = lambda d: d.isoformat()
 
 # ── prune_old_articles ────────────────────────────────────
-# delete_audio_bulk receives the full list of IDs at once (bulk R2 call).
-deleted_audio_bulk: list[list[str]] = []
-tts_r2.delete_audio_bulk = lambda ids: deleted_audio_bulk.append(list(ids))
+# delete_media_bulk receives the full list of IDs at once (bulk R2 call).
+deleted_media_bulk: list[list[str]] = []
+tts_r2.delete_media_bulk = lambda ids: deleted_media_bulk.append(list(ids))
 
 store = [
     {"id": "fresh", "publishedAt": iso(now - timedelta(days=2)),
@@ -45,8 +45,8 @@ store = [
 kept, ndel = ingest.prune_old_articles(store)
 check("prune drops the 20-day-old article", ndel == 1)
 check("prune keeps fresh + nodate", {a["id"] for a in kept} == {"fresh", "nodate"})
-check("prune calls delete_audio_bulk once with all dropped IDs",
-      deleted_audio_bulk == [["old"]])
+check("prune calls delete_media_bulk once with all dropped IDs",
+      deleted_media_bulk == [["old"]])
 
 # ── synthesize_pending_audio ──────────────────────────────
 tts_r2.r2_enabled = lambda: True

@@ -259,8 +259,8 @@ def delete_audio(article_id: str) -> None:
     delete_audio_bulk([article_id])
 
 
-def delete_audio_bulk(article_ids: list[str]) -> None:
-    """Delete R2 audio files for multiple articles in ONE API call.
+def delete_media_bulk(article_ids: list[str]) -> None:
+    """Delete R2 audio + image files for multiple articles in ONE API call.
 
     WHY: the old per-article loop called delete_object() twice per article
     (canonical path + legacy root path). Pruning 30 articles = 60 separate
@@ -269,23 +269,33 @@ def delete_audio_bulk(article_ids: list[str]) -> None:
     regardless of how many articles are dropped.
 
     Keys built per article:
-      audio/{id}.mp3   — canonical path (since 2026-05-23)
-      {id}.mp3         — legacy root path (pre-2026-05-23 orphans)
-    Both are included so legacy MP3s age out cleanly without a separate pass.
-    Idempotent: missing keys are silently ignored by R2.
+      audio/{id}.mp3        — canonical audio path (since 2026-05-23)
+      {id}.mp3              — legacy root path (pre-2026-05-23 orphans)
+      images/{id}_0..4.webp — admin-uploaded images (WebP, up to 5 per article)
+      images/{id}_0..4.jpg  — legacy JPG format (pre-WebP conversion)
+
+    Missing keys are silently ignored by R2 (idempotent). Trying indices
+    0-4 for images is safe — most articles have 0-2 images and R2 treats
+    a delete of a non-existent key as a no-op.
     """
     if not r2_enabled() or not article_ids:
         return
-    keys = [
-        {"Key": k}
-        for aid in article_ids if aid
-        for k in (f"audio/{aid}.mp3", f"{aid}.mp3")
-    ]
+    keys = []
+    for aid in article_ids:
+        if not aid:
+            continue
+        # Audio — canonical + legacy root path
+        keys.append({"Key": f"audio/{aid}.mp3"})
+        keys.append({"Key": f"{aid}.mp3"})
+        # Images — try indices 0-4 in both WebP (current) and JPG (legacy)
+        for idx in range(5):
+            keys.append({"Key": f"images/{aid}_{idx}.webp"})
+            keys.append({"Key": f"images/{aid}_{idx}.jpg"})
     if not keys:
         return
     # Chunk at 1000 — S3/R2 hard limit per delete_objects request.
-    # In practice: 14-day retention × ~60 new articles/day max ≈ 840 articles
-    # max in store, so a typical prune batch is well under 1000.
+    # Per article: 2 audio + 10 image keys = 12 keys. A prune batch of
+    # ~80 articles → ~960 keys, fits in a single API call.
     _CHUNK = 1000
     for i in range(0, len(keys), _CHUNK):
         batch = keys[i : i + _CHUNK]
@@ -298,6 +308,10 @@ def delete_audio_bulk(article_ids: list[str]) -> None:
             for err in resp.get("Errors", []):
                 log.debug("delete_objects partial error — key=%s msg=%s",
                           err.get("Key"), err.get("Message"))
-            log.info("delete_audio_bulk: %d keys deleted in 1 R2 call", len(batch))
+            log.info("delete_media_bulk: %d keys attempted in 1 R2 call", len(batch))
         except Exception as e:
-            log.warning("delete_audio_bulk failed (batch %d keys): %s", len(batch), e)
+            log.warning("delete_media_bulk failed (batch %d keys): %s", len(batch), e)
+
+
+# Keep old name as alias so any external callers aren't broken.
+delete_audio_bulk = delete_media_bulk

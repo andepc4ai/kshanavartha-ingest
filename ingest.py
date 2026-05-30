@@ -1787,7 +1787,7 @@ def main() -> int:
 
     # ─── Cleanup: drop articles older than RETENTION_DAYS ──
     store, deleted = prune_old_articles(store)
-    log.info("cleanup done — deleted=%d (older than %d days)", deleted, RETENTION_DAYS)
+    log.info("cleanup done — pruned=%d articles + audio/images from R2 (older than %d days)", deleted, RETENTION_DAYS)
 
     # ─── Persist working set + publish public feed → R2 ─────
     # Decision 3: the article store IS R2 JSON (no Firestore in this path).
@@ -2274,7 +2274,7 @@ cleanup_existing_video_items = cleanup_existing_articles
 def prune_old_articles(store: list[dict]) -> tuple[list[dict], int]:
     """
     Drop articles older than RETENTION_DAYS from the in-memory working set
-    and delete their R2 audio (keeps R2 storage bounded). Returns
+    and delete their R2 audio + images (keeps R2 storage bounded). Returns
     (kept_articles, deleted_count). (Decision 3 — no Firestore.)
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
@@ -2286,10 +2286,10 @@ def prune_old_articles(store: list[dict]) -> tuple[list[dict], int]:
             dropped_ids.append(d.get("id", ""))
         else:
             kept.append(d)
-    # Bulk-delete all audio in ONE R2 API call instead of N*2 individual
-    # delete_object calls. delete_audio_bulk handles chunking at 1000 keys.
+    # Bulk-delete audio + images in ONE R2 API call instead of N×12 individual
+    # delete_object calls. delete_media_bulk handles chunking at 1000 keys.
     if dropped_ids:
-        tts_r2.delete_audio_bulk(dropped_ids)
+        tts_r2.delete_media_bulk(dropped_ids)
     return kept, len(dropped_ids)
 
 
