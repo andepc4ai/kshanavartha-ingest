@@ -130,7 +130,7 @@ SPORTS_MAX        = int(os.environ.get("SPORTS_MAX")        or "75")
 # Time-bucket size for feed ordering. Within each bucket articles are ordered
 # by tier (politics first), but newer buckets always beat older buckets so a
 # recent general article outranks an old politics article.
-FEED_BUCKET_HOURS = int(os.environ.get("FEED_BUCKET_HOURS") or "2")
+FEED_BUCKET_HOURS = int(os.environ.get("FEED_BUCKET_HOURS") or "1")
 # Minimum hours between push notifications. Set via NOTIFICATION_GAP_HOURS
 # GitHub Variable. Default 3 h → max 8 pushes/day even on a fast news day.
 NOTIFICATION_GAP_HOURS = int(os.environ.get("NOTIFICATION_GAP_HOURS") or "3")
