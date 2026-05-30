@@ -86,4 +86,37 @@ jobs:
           GNEWS_RESOLVE_MAX: ${{ vars.GNEWS_RESOLVE_MAX }}
           # DATA_GOV_API_KEY: data.gov.in key for mandi (source dead — future use)
           DATA_GOV_API_KEY: ${{ secrets.DATA_GOV_API_KEY }}
-        run: python ingest.py
+        shell: bash
+        run: |
+          set -o pipefail
+          python ingest.py 2>&1 | tee /tmp/ingest_output.txt
+
+      - name: Prepare email body
+        if: always()
+        shell: bash
+        run: |
+          STATUS="${{ job.status }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          {
+            echo "KshanaVartha Ingest — Run #${{ github.run_number }}"
+            echo "Status  : ${STATUS}"
+            echo "Time    : $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "Details : ${RUN_URL}"
+            echo ""
+            echo "=== Ingest Log (last 300 lines) ==="
+            tail -300 /tmp/ingest_output.txt 2>/dev/null || echo "(no output captured — ingest step did not start)"
+          } > /tmp/email_body.txt
+
+      - name: Send email notification
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: kshanavartha@gmail.com
+          password: ${{ secrets.EMAIL_APP_PASSWORD }}
+          subject: "KshanaVartha Ingest #${{ github.run_number }} — ${{ job.status }}"
+          to: kshanavartha@gmail.com
+          from: KshanaVartha Ingest <kshanavartha@gmail.com>
+          body_filepath: /tmp/email_body.txt
