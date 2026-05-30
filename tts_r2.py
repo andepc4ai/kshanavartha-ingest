@@ -136,6 +136,62 @@ def _synth(text: str, path: str) -> None:
     _gtts_synth(text, path)
 
 
+def _recompress_mp3_file(path: str) -> None:
+    """Re-encode an MP3 file in-place at 64 kbps / 22 050 Hz mono via ffmpeg.
+
+    gTTS outputs 128 kbps MP3 (~128 KB/min of speech). At 64 kbps mono
+    22 kHz, speech is fully intelligible and the file is ~50% smaller —
+    a meaningful saving when storing hundreds of narrated articles on R2.
+
+    Best-effort: no-op if ffmpeg is absent or if re-encoding fails.
+    GitHub Actions ubuntu-latest has ffmpeg pre-installed.
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        log.debug("_recompress_mp3_file: ffmpeg not found — skipping")
+        return
+    tmp = path + ".reenc.mp3"
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", path,
+                "-ar", "22050",  # 22 kHz — adequate for speech
+                "-ac", "1",      # mono
+                "-b:a", "64k",   # 64 kbps CBR
+                tmp,
+            ],
+            capture_output=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            log.warning(
+                "_recompress_mp3_file: ffmpeg exited %d for %s",
+                result.returncode, path,
+            )
+            return
+        new_size = os.path.getsize(tmp)
+        if new_size == 0:
+            return
+        orig_size = os.path.getsize(path)
+        os.replace(tmp, path)   # atomic in-place replace
+        log.info(
+            "_recompress_mp3_file: %s %d KB → %d KB (saved %.0f%%)",
+            os.path.basename(path),
+            orig_size // 1024, new_size // 1024,
+            100 * (1 - new_size / max(orig_size, 1)),
+        )
+    except Exception as e:
+        log.warning("_recompress_mp3_file: exception for %s: %s", path, e)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 def synthesize_and_upload(article_id: str, text: str) -> str | None:
     """
     Narrate `text` (the Telugu summary) and upload as
@@ -161,6 +217,10 @@ def synthesize_and_upload(article_id: str, text: str) -> str | None:
                 log.warning("tts produced empty audio for %s (attempt %d)",
                             article_id, attempt + 1)
                 raise ValueError("empty audio")
+
+            # Re-encode at 64 kbps mono — ~50% smaller than raw gTTS output.
+            # No-op if ffmpeg not installed; never raises.
+            _recompress_mp3_file(tmp)
 
             # Canonical R2 layout: audio under audio/<id>.mp3, matching
             # what the admin tool uses (admin/main.py uploads to

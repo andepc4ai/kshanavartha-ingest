@@ -27,6 +27,7 @@ Env: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
 """
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
@@ -76,16 +77,23 @@ def upload_feed(articles: list[dict]) -> str | None:
             ensure_ascii=False,            # keep Telugu readable
             separators=(",", ":"),
         ).encode("utf-8")
+        # Gzip before upload: ~600 KB raw JSON → ~120 KB compressed (~80% saving).
+        # HTTP clients (Android WebView fetch, browsers) auto-decompress
+        # Content-Encoding: gzip transparently — no app-side changes needed.
+        compressed = gzip.compress(payload, compresslevel=9)
         _r2_client().put_object(
             Bucket=R2_BUCKET,
             Key=FEED_KEY,
-            Body=payload,
+            Body=compressed,
             ContentType="application/json; charset=utf-8",
+            ContentEncoding="gzip",
             CacheControl="no-cache",
         )
         url = f"{R2_PUBLIC_URL}/{FEED_KEY}"
-        log.info("feed exported — %d articles → %s (%d KB)",
-                 len(articles), url, len(payload) // 1024)
+        log.info(
+            "feed exported — %d articles → %s (%d KB raw → %d KB gzip)",
+            len(articles), url, len(payload) // 1024, len(compressed) // 1024,
+        )
         return url
     except Exception as e:
         log.warning("feed export failed: %s", e)
