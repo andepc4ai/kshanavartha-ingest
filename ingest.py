@@ -335,6 +335,30 @@ CATEGORY_RULES: list[tuple[str, list[str]]] = [
         "village", "panchayat", "gram", "sarpanch", "ward sachivalayam",
         "accident", "fire", "snake", "theft", "hospital",
     ]),
+    # ── cinema: BEFORE politics ──────────────────────────────────────────
+    # Cinema must be checked before politics. Many entertainment articles
+    # mention political names (actor who is a politician's relative, a
+    # film about politics, etc.) and would wrongly land in politics if
+    # this rule came later.
+    ("cinema",   [
+        # Telugu — core cinema words
+        "సినిమా", "చిత్రం", "సినీ", "హీరో", "హీరోయిన్", "దర్శకుడు",
+        "నటుడు", "నటి", "నటులు", "నటన", "బాక్సాఫీస్", "ట్రైలర్", "టీజర్",
+        "ఓటీటీ", "రివ్యూ", "షూటింగ్", "టాలీవుడ్", "ఫస్ట్ లుక్", "విడుదల",
+        # Telugu — transliterations commonly used in headlines
+        "డైరెక్టర్",           # director (Telugu script)
+        "ఆడియో",               # audio launch / song release
+        "బ్లాక్‌బస్టర్",      # blockbuster
+        "మ్యూజిక్",            # music
+        "ప్రి-రిలీజ్", "ప్రి రిలీజ్",  # pre-release event
+        "అవార్డు",             # award (film awards)
+        "వెబ్ సిరీస్",         # web series
+        # English
+        "movie", "cinema", "film", "tollywood", "box office", "trailer",
+        "teaser", "ott", "review", "first look", "actor", "actress",
+        "director", "song release", "pre-release", "audio launch",
+        "blockbuster", "web series",
+    ]),
     # ── politics: strong signals only ───────────────────────────────────
     # REMOVED: "ప్రభుత్వం" (govt — appears in every news story, too broad)
     # REMOVED: "minister" (English generic — fires on any minister visit/event)
@@ -361,14 +385,6 @@ CATEGORY_RULES: list[tuple[str, list[str]]] = [
         "క్రికెట్", "క్రీడ", "మ్యాచ్", "టోర్నీ", "ఐపీఎల్",
         "cricket", "sport", "match", "tournament", "ipl", "olympic",
         "kabaddi", "kho kho", "tennis", "football", "hockey", "athlet",
-    ]),
-    ("cinema",   [
-        "సినిమా", "చిత్రం", "సినీ", "హీరో", "హీరోయిన్", "దర్శకుడు",
-        "నటుడు", "నటి", "బాక్సాఫీస్", "ట్రైలర్", "టీజర్", "ఓటీటీ",
-        "రివ్యూ", "షూటింగ్", "టాలీవుడ్", "ఫస్ట్ లుక్", "విడుదల",
-        "movie", "cinema", "film", "tollywood", "box office", "trailer",
-        "teaser", "ott", "review", "first look", "actor", "actress",
-        "director", "song release", "pre-release",
     ]),
 ]
 
@@ -1633,11 +1649,23 @@ def main() -> int:
                     # (or always, if we got a clean Telugu title).
                     if p_title and (a.lang == "en" or _looks_english(a.headline)):
                         headline_out = p_title
-                    # Use AI category if the model returned a valid one.
-                    # AI sees the full article context so its judgment is more
-                    # accurate than keyword rules on raw RSS text.
-                    if p_cat:
-                        category = p_cat
+                    # Category resolution — three passes, most-reliable first:
+                    # 1. Keyword detection on the AI-generated Telugu headline.
+                    #    This is the cleanest signal: short, Telugu-only, no
+                    #    political noise from the raw RSS body.
+                    # 2. AI-returned category — only accepted when both keyword
+                    #    passes returned "general" (no strong signal found).
+                    #    AI is NOT allowed to override a confident keyword match
+                    #    (e.g. cinema → politics) because AI often mis-classifies
+                    #    when the article body contains incidental political names.
+                    if p_title:
+                        ai_headline_cat = detect_category(p_title)
+                        if ai_headline_cat != "general":
+                            category = ai_headline_cat  # clean headline wins
+                        elif p_cat and category == "general":
+                            category = p_cat            # AI helps when both passes uncertain
+                    elif p_cat and category == "general":
+                        category = p_cat                # no AI headline — fall back to AI cat
                     summarized += 1
                 else:
                     polished = None
