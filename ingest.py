@@ -124,9 +124,13 @@ CINEMA_MAX = int(os.environ.get("CINEMA_MAX") or "8")
 # small enough that feed.json downloads fast on mobile (75×3+8 ≈ 230 articles
 # ≈ 600 KB vs 450 articles ≈ 1.4 MB at the old 150 default).
 # 0 = no cap per tier (not recommended — politics will crowd everything out).
-POLITICS_MAX = int(os.environ.get("POLITICS_MAX") or "75")
-FARMING_MAX  = int(os.environ.get("FARMING_MAX")  or "75")
-SPORTS_MAX   = int(os.environ.get("SPORTS_MAX")   or "75")
+POLITICS_MAX      = int(os.environ.get("POLITICS_MAX")      or "75")
+FARMING_MAX       = int(os.environ.get("FARMING_MAX")       or "75")
+SPORTS_MAX        = int(os.environ.get("SPORTS_MAX")        or "75")
+# Time-bucket size for feed ordering. Within each bucket articles are ordered
+# by tier (politics first), but newer buckets always beat older buckets so a
+# recent general article outranks an old politics article.
+FEED_BUCKET_HOURS = int(os.environ.get("FEED_BUCKET_HOURS") or "2")
 # Minimum hours between push notifications. Set via NOTIFICATION_GAP_HOURS
 # GitHub Variable. Default 3 h → max 8 pushes/day even on a fast news day.
 NOTIFICATION_GAP_HOURS = int(os.environ.get("NOTIFICATION_GAP_HOURS") or "3")
@@ -1920,6 +1924,27 @@ def _build_feed_combined(store: list[dict]) -> tuple[list[dict], dict]:
             )
 
     combined = combined[:FEED_MAX]
+
+    # ── Time-bucket + tier sort ───────────────────────────────────────────
+    # Re-order the selected articles so that recency and tier both matter.
+    # Key = (bucket, tier, -timestamp):
+    #   bucket 0 = 0–FEED_BUCKET_HOURS hours ago (most recent window)
+    #   Within a bucket: tier 0 (politics) beats tier 2 (general)
+    #   Across buckets: a fresh general article beats a stale politics one
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    def _bucket_key(d: dict) -> tuple:
+        pub = d.get("publishedAt") or d.get("createdAt") or ""
+        try:
+            ts = datetime.fromisoformat(pub.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            ts = 0.0
+        hours_ago = max(0.0, (now_ts - ts) / 3600)
+        bucket = int(hours_ago / FEED_BUCKET_HOURS)
+        tier   = _FEED_TIER.get(d.get("category") or "general", 2)
+        return (bucket, tier, -ts)
+
+    combined.sort(key=_bucket_key)
 
     stats = {
         "tier0": len(tier0), "tier1": len(tier1),
