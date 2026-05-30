@@ -95,17 +95,18 @@ jobs:
         if: always()
         shell: bash
         run: |
-          STATUS="${{ job.status }}"
-          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          LOG=$(tail -300 /tmp/ingest_output.txt 2>/dev/null || echo "(no output captured — ingest step did not start)")
           {
+            echo "EMAIL_BODY<<KV_EOF"
             echo "KshanaVartha Ingest — Run #${{ github.run_number }}"
-            echo "Status  : ${STATUS}"
+            echo "Status  : ${{ job.status }}"
             echo "Time    : $(date -u '+%Y-%m-%d %H:%M UTC')"
-            echo "Details : ${RUN_URL}"
+            echo "Details : https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo ""
             echo "=== Ingest Log (last 300 lines) ==="
-            tail -300 /tmp/ingest_output.txt 2>/dev/null || echo "(no output captured — ingest step did not start)"
-          } > /tmp/email_body.txt
+            echo "$LOG"
+            echo "KV_EOF"
+          } >> "$GITHUB_ENV"
 
       - name: Send email notification
         if: always()
@@ -119,4 +120,4 @@ jobs:
           subject: "KshanaVartha Ingest #${{ github.run_number }} — ${{ job.status }}"
           to: kshanavartha@gmail.com
           from: KshanaVartha Ingest <kshanavartha@gmail.com>
-          body_filepath: /tmp/email_body.txt
+          body: ${{ env.EMAIL_BODY }}
