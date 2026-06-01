@@ -95,7 +95,11 @@ jobs:
         if: always()
         shell: bash
         run: |
-          LOG=$(tail -300 /tmp/ingest_output.txt 2>/dev/null || echo "(no output captured — ingest step did not start)")
+          FULL_LOG=$(cat /tmp/ingest_output.txt 2>/dev/null || echo "(no output captured — ingest step did not start)")
+          # Extract the structured run summary block (between the === lines)
+          SUMMARY=$(echo "$FULL_LOG" | awk '/^={10}/{p=!p; print; next} p{print}' | head -80)
+          # Last 400 lines of raw log for full diagnostics
+          RAW_LOG=$(echo "$FULL_LOG" | tail -400)
           {
             echo "EMAIL_BODY<<KV_EOF"
             echo "KshanaVartha Ingest — Run #${{ github.run_number }}"
@@ -103,8 +107,12 @@ jobs:
             echo "Time    : $(date -u '+%Y-%m-%d %H:%M UTC')"
             echo "Details : https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo ""
-            echo "=== Ingest Log (last 300 lines) ==="
-            echo "$LOG"
+            if [ -n "$SUMMARY" ]; then
+              echo "$SUMMARY"
+            fi
+            echo ""
+            echo "=== Full Log (last 400 lines) ==="
+            echo "$RAW_LOG"
             echo "KV_EOF"
           } >> "$GITHUB_ENV"
 

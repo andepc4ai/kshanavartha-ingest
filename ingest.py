@@ -603,6 +603,27 @@ class GeminiKeyPool:
         self.keys = [k.strip() for k in keys if k and k.strip()]
         self.exhausted: set[str] = set()
         self.idx = 0
+        # Per-key usage stats accumulated during the run.
+        self.key_stats: dict[str, dict] = {
+            k: {"calls": 0, "success": 0, "fail": 0, "quota_hits": 0,
+                "prompt_tokens": 0, "comp_tokens": 0}
+            for k in self.keys
+        }
+
+    def record_call(self, key: str, *, success: bool, quota: bool = False,
+                    prompt_tokens: int = 0, comp_tokens: int = 0) -> None:
+        s = self.key_stats.get(key)
+        if not s:
+            return
+        s["calls"] += 1
+        if success:
+            s["success"] += 1
+        elif quota:
+            s["quota_hits"] += 1
+        else:
+            s["fail"] += 1
+        s["prompt_tokens"] += prompt_tokens
+        s["comp_tokens"] += comp_tokens
 
     def current(self) -> str | None:
         for _ in range(len(self.keys)):
@@ -811,6 +832,7 @@ def gemini_summarize(pool: GeminiKeyPool, headline: str, raw_summary: str) -> st
             # reason so we can tell "daily quota gone" vs "per-minute throttle".
             log.warning("gemini key ...%s 429 QUOTA: %s",
                         key[-6:], r.text[:200].replace("\n", " "))
+            pool.record_call(key, success=False, quota=True)
             pool.mark_exhausted(key)
             continue  # try next key
         if r.status_code == 403:
@@ -818,10 +840,12 @@ def gemini_summarize(pool: GeminiKeyPool, headline: str, raw_summary: str) -> st
             # at reset — the key itself is broken and must be replaced.
             log.warning("gemini key ...%s 403 INVALID-KEY (needs replacing): %s",
                         key[-6:], r.text[:200].replace("\n", " "))
+            pool.record_call(key, success=False, quota=True)
             pool.mark_exhausted(key)
             continue
         if not r.ok:
             log.warning("gemini http %d: %s", r.status_code, r.text[:120])
+            pool.record_call(key, success=False)
             return None
         try:
             data = r.json()
@@ -831,9 +855,14 @@ def gemini_summarize(pool: GeminiKeyPool, headline: str, raw_summary: str) -> st
                 .get("parts", [{}])[0]
                 .get("text", "")
             )
+            usage = data.get("usageMetadata", {})
+            ptok = int(usage.get("promptTokenCount") or 0)
+            ctok = int(usage.get("candidatesTokenCount") or 0)
+            pool.record_call(key, success=bool(text), prompt_tokens=ptok, comp_tokens=ctok)
             return text.strip().strip("\"'") if text else None
         except Exception as e:
             log.warning("gemini parse failed: %s", e)
+            pool.record_call(key, success=False)
             return None
 
 
@@ -868,17 +897,24 @@ def sambanova_summarize(headline: str, raw_summary: str) -> str | None:
         if r.status_code == 429:
             log.warning("sambanova key ...%s 429: %s",
                         key[-6:], r.text[:220].replace("\n", " "))
+            sambanova_pool.record_call(key, success=False, quota=True)
             sambanova_pool.mark_exhausted(key)
             continue  # try next key
         if not r.ok:
             log.warning("sambanova http %d: %s", r.status_code, r.text[:140])
+            sambanova_pool.record_call(key, success=False)
             return None
         try:
             data = r.json()
             text = data["choices"][0]["message"]["content"]
+            usage = data.get("usage", {})
+            ptok = int(usage.get("prompt_tokens") or 0)
+            ctok = int(usage.get("completion_tokens") or 0)
+            sambanova_pool.record_call(key, success=bool(text), prompt_tokens=ptok, comp_tokens=ctok)
             return text.strip().strip("\"'") if text else None
         except Exception as e:
             log.warning("sambanova parse failed: %s", e)
+            sambanova_pool.record_call(key, success=False)
             return None
 
 
@@ -918,25 +954,33 @@ def cerebras_summarize(headline: str, raw_summary: str) -> str | None:
         if r.status_code == 429:
             log.warning("cerebras key ...%s 429: %s",
                         key[-6:], r.text[:220].replace("\n", " "))
+            cerebras_pool.record_call(key, success=False, quota=True)
             cerebras_pool.mark_exhausted(key)
             continue
         if not r.ok:
             log.warning("cerebras http %d: %s", r.status_code, r.text[:160])
+            cerebras_pool.record_call(key, success=False)
             return None
         data = r.json()
         choices = data.get("choices") or []
         if not choices:
             log.warning("cerebras no choices: %s", str(data)[:300])
+            cerebras_pool.record_call(key, success=False)
             return None
         msg = choices[0].get("message") or {}
         # gpt-oss-120b is a thinking model — may return content=None with
         # reasoning_content populated. Try content first, fall back to
         # reasoning_content so we don't silently discard valid output.
         text = msg.get("content") or msg.get("reasoning_content") or ""
+        usage = data.get("usage", {})
+        ptok = int(usage.get("prompt_tokens") or 0)
+        ctok = int(usage.get("completion_tokens") or 0)
         if not text:
             finish = choices[0].get("finish_reason", "?")
             log.warning("cerebras empty content (finish_reason=%s) — skipping article", finish)
+            cerebras_pool.record_call(key, success=False, prompt_tokens=ptok, comp_tokens=ctok)
             return None
+        cerebras_pool.record_call(key, success=True, prompt_tokens=ptok, comp_tokens=ctok)
         return text.strip().strip("\"'")
 
 
@@ -1597,13 +1641,23 @@ def main() -> int:
     new_articles_list: list[dict] = []   # track new dicts for FCM (not just count)
     summarized = 0
     gnews_enriched = 0
-    counters = {"gemini_calls": 0, "sambanova_calls": 0}
+    feeds_ok = 0
+    feeds_failed = 0
+    counters = {
+        "gemini_calls": 0, "sambanova_calls": 0,
+        # AI engine success counts (tracked in article loop)
+        "cerebras_ok": 0, "gemini_ok": 0, "sambanova_ok": 0,
+        # Article skip reasons
+        "skip_english": 0, "skip_te_rich": 0, "skip_video": 0, "ai_fail": 0,
+    }
 
     for feed in FEEDS:
         try:
             items = parse_feed(feed)
+            feeds_ok += 1
         except Exception as e:
             log.warning("feed failed %s: %s", feed["url"], e)
+            feeds_failed += 1
             continue
         log.info("feed=%-30s items=%d", feed["source"], len(items))
         fetched += len(items)
@@ -1665,8 +1719,23 @@ def main() -> int:
                         if ai_headline_cat != "general":
                             category = ai_headline_cat  # clean headline wins
                     summarized += 1
+                    # Track which engine succeeded
+                    if _engine == "cerebras":
+                        counters["cerebras_ok"] += 1
+                    elif _engine == "gemini":
+                        counters["gemini_ok"] += 1
+                    elif _engine == "sambanova":
+                        counters["sambanova_ok"] += 1
                 else:
+                    counters["ai_fail"] += 1
                     polished = None
+            else:
+                if skip_english:
+                    counters["skip_english"] += 1
+                elif skip_te_rich:
+                    counters["skip_te_rich"] += 1
+                elif skip_video:
+                    counters["skip_video"] += 1
 
             # For native-rich Telugu: no AI ran, but sanitize the raw RSS text
             # to strip junk chars (►, 🔥, ★ etc.) before storing.
@@ -1786,15 +1855,17 @@ def main() -> int:
         log.warning("village reporter promote error: %s", e)
 
     # ─── Audio: narrate Telugu summaries → R2 (capped per run) ─
+    audio_stats: dict = {"voiced": 0, "failed": 0, "skipped": 0, "candidates": 0}
+    feed_visible_ids: set = set()
     try:
         # Compute the set of article IDs that will appear in feed.json so
         # audio synthesis focuses only on feed-visible content. Articles
         # excluded from the feed (old, over-cap, non-Telugu) are skipped.
         feed_visible_ids = _feed_article_ids(store)
         log.info("audio: %d feed-visible article(s) eligible for narration", len(feed_visible_ids))
-        voiced = synthesize_pending_audio(store, AUDIO_MAX_PER_RUN, feed_ids=feed_visible_ids)
-        if voiced:
-            log.info("audio done — narrated=%d article(s) → R2", voiced)
+        audio_stats = synthesize_pending_audio(store, AUDIO_MAX_PER_RUN, feed_ids=feed_visible_ids)
+        if audio_stats["voiced"]:
+            log.info("audio done — narrated=%d article(s) → R2", audio_stats["voiced"])
     except Exception as e:
         log.warning("audio step error: %s", e)
 
@@ -1828,6 +1899,29 @@ def main() -> int:
     except Exception as e:
         log.warning("feed export error: %s", e)
 
+    # ─── Structured run report (captured in email) ────────
+    feed_published = len([d for d in store if _is_telugu_feed_item(d)])
+    audio_pending = sum(
+        1 for d in store
+        if not d.get("audioUrl")
+        and d.get("ai") is True
+        and d.get("id") in feed_visible_ids
+        and not d.get("videoId")
+        and not _looks_english((d.get("summary") or "").strip())
+        and len((d.get("summary") or "").strip()) >= 10
+    )
+    _print_run_report(
+        feeds_ok=feeds_ok, feeds_failed=feeds_failed,
+        fetched=fetched, new_count=new_count,
+        gnews_enriched=gnews_enriched, blocked_count=len(blocked_ids),
+        counters=counters, summarized=summarized,
+        audio_stats=audio_stats, audio_pending=audio_pending,
+        feed_visible=len(feed_visible_ids),
+        store_total=len(store), feed_published=feed_published,
+        pruned=deleted, retention_days=RETENTION_DAYS,
+        gemini_pool=pool, cerebras_pool=cerebras_pool,
+        sambanova_pool=sambanova_pool,
+    )
     return 0
 
 
@@ -2237,7 +2331,7 @@ def synthesize_pending_audio(store: list[dict], limit: int,
 
     log.info("audio summary — voiced=%d failed=%d skipped=%d candidates=%d",
              done, failed, skipped, candidates)
-    return done
+    return {"voiced": done, "failed": failed, "skipped": skipped, "candidates": candidates}
 
 
 def cleanup_existing_articles(store: list[dict]) -> tuple[int, int]:
@@ -3017,6 +3111,104 @@ def notify_new_articles(db: firestore.Client, store: list[dict],
         "fcm sent — article=%s category=%s sent_to=%d/%d tokens",
         article_id[:12], lead.get("category", "?"), sent, len(token_docs),
     )
+
+
+def _print_run_report(
+    *,
+    feeds_ok: int, feeds_failed: int,
+    fetched: int, new_count: int,
+    gnews_enriched: int, blocked_count: int,
+    counters: dict, summarized: int,
+    audio_stats: dict, audio_pending: int, feed_visible: int,
+    store_total: int, feed_published: int, pruned: int, retention_days: int,
+    gemini_pool, cerebras_pool, sambanova_pool,
+) -> None:
+    """Print a structured run summary to stdout. Appears in the last 300
+    log lines so the email always captures it."""
+    sep = "=" * 62
+    print(f"\n{sep}")
+    print("  KshanaVartha Ingest — Run Summary")
+    print(sep)
+
+    # Feeds
+    print(f"\nFEEDS  ({feeds_ok + feeds_failed} sources)")
+    print(f"  OK: {feeds_ok}  |  Failed: {feeds_failed}")
+    if gnews_enriched:
+        print(f"  Google News resolved: {gnews_enriched} links → real publisher URLs")
+
+    # Articles
+    dup_skipped = fetched - new_count
+    print(f"\nARTICLES")
+    print(f"  Fetched        : {fetched}")
+    print(f"  New (stored)   : {new_count}")
+    print(f"  Duplicates     : {dup_skipped}")
+    if blocked_count:
+        print(f"  Blocked IDs    : {blocked_count} (in blocklist.json)")
+
+    # AI processing
+    skip_eng = counters.get("skip_english", 0)
+    skip_te  = counters.get("skip_te_rich", 0)
+    skip_vid = counters.get("skip_video", 0)
+    ai_fail  = counters.get("ai_fail", 0)
+    print(f"\nAI PROCESSING  (of {new_count} new articles)")
+    print(f"  AI polished    : {summarized}  "
+          f"(cerebras={counters.get('cerebras_ok',0)}  "
+          f"gemini={counters.get('gemini_ok',0)}  "
+          f"sambanova={counters.get('sambanova_ok',0)})")
+    print(f"  Native Telugu  : {skip_te}   (≥60 Te words — no AI needed, audio-eligible)")
+    print(f"  English held   : {skip_eng}   (ENGLISH_POLISH not set)")
+    print(f"  YouTube videos : {skip_vid}   (no AI for video items)")
+    print(f"  AI called, failed : {ai_fail}")
+
+    def _pool_section(title: str, model: str, pool) -> None:
+        n = len(pool.keys)
+        exhausted = len(pool.exhausted)
+        print(f"\n{title} ({model}) — {n} key(s)  [exhausted this run: {exhausted}]")
+        if not pool.keys:
+            print("  (no keys configured)")
+            return
+        total_calls = total_ok = total_fail = total_quota = 0
+        total_ptok = total_ctok = 0
+        for k in pool.keys:
+            s = pool.key_stats.get(k, {})
+            calls = s.get("calls", 0)
+            ok    = s.get("success", 0)
+            fail  = s.get("fail", 0)
+            quota = s.get("quota_hits", 0)
+            ptok  = s.get("prompt_tokens", 0)
+            ctok  = s.get("comp_tokens", 0)
+            tag   = " *** EXHAUSTED ***" if k in pool.exhausted else ""
+            tok_s = f"  in={ptok:,} out={ctok:,} tok" if (ptok or ctok) else "  (tokens: n/a)"
+            print(f"  ...{k[-6:]} : {calls:3d} calls | {ok:3d} OK | "
+                  f"{fail:2d} fail | {quota:2d} quota{tok_s}{tag}")
+            total_calls += calls; total_ok += ok; total_fail += fail
+            total_quota += quota; total_ptok += ptok; total_ctok += ctok
+        if n > 1:
+            tok_total = f"  in={total_ptok:,} out={total_ctok:,} tok" if (total_ptok or total_ctok) else ""
+            print(f"  {'TOTAL':8s} : {total_calls:3d} calls | {total_ok:3d} OK | "
+                  f"{total_fail:2d} fail | {total_quota:2d} quota{tok_total}")
+
+    _pool_section("CEREBRAS", CEREBRAS_MODEL, cerebras_pool)
+    _pool_section("GEMINI", GEMINI_MODEL, gemini_pool)
+    _pool_section("SAMBANOVA", SAMBANOVA_MODEL, sambanova_pool)
+
+    # Audio
+    voiced     = audio_stats.get("voiced", 0)
+    aud_fail   = audio_stats.get("failed", 0)
+    candidates = audio_stats.get("candidates", 0)
+    print(f"\nAUDIO (gTTS → R2)  [cap={AUDIO_MAX_PER_RUN}/run]")
+    print(f"  Feed-visible articles : {feed_visible}")
+    print(f"  Eligible (ai=True, no audio yet) : {candidates}")
+    print(f"  Voiced this run  : {voiced}  |  Failed: {aud_fail}")
+    print(f"  Still pending    : {audio_pending}  (will voice in later runs)")
+
+    # Store & feed
+    print(f"\nSTORE → R2")
+    print(f"  Total articles saved : {store_total}")
+    print(f"  Feed published       : {feed_published}  (Telugu-readable)")
+    print(f"  Pruned (old)         : {pruned}  (older than {retention_days} days)")
+
+    print(f"\n{sep}\n")
 
 
 if __name__ == "__main__":
