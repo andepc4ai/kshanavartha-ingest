@@ -52,12 +52,14 @@ jobs:
       - name: Set training date key
         run: echo "TRAIN_DATE=$(date -u '+%Y-%m-%d')" >> "$GITHUB_ENV"
 
-      - name: Restore cached category model
+      - name: Restore cached models
         id: cache-model
         uses: actions/cache@v4
         with:
-          path: category_model.pkl
-          key: category-model-${{ env.TRAIN_DATE }}
+          path: |
+            category_model.pkl
+            level_model.pkl
+          key: kv-models-${{ env.TRAIN_DATE }}
 
       - name: Train category classifier
         if: steps.cache-model.outputs.cache-hit != 'true'
@@ -101,7 +103,8 @@ jobs:
             python train_categorizer.py \
               --training-data /tmp/training_data.jsonl \
               --model category_model.pkl \
-            && echo "Category classifier trained OK" \
+              --level-model level_model.pkl \
+            && echo "Category + level classifiers trained OK" \
             || echo "WARNING: training failed — ingest will use keyword fallback"
           fi
 

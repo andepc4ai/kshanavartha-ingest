@@ -287,6 +287,9 @@ try:
         CategoryClassifier,
         CONFIDENCE_THRESHOLD as _CAT_THRESHOLD,
         MODEL_PATH as _CAT_MODEL_PATH,
+        LevelClassifier,
+        LEVEL_CONFIDENCE_THRESHOLD as _LVL_THRESHOLD,
+        LEVEL_MODEL_PATH as _LVL_MODEL_PATH,
     )
     _cat_model = CategoryClassifier.load_or_none(_CAT_MODEL_PATH)
     if _cat_model:
@@ -294,9 +297,17 @@ try:
                  _cat_model.training_stats.get("cv_accuracy", 0) * 100)
     else:
         log.info("category_model.pkl not found — using keyword detection")
+    _lvl_model = LevelClassifier.load_or_none(_LVL_MODEL_PATH)
+    if _lvl_model:
+        log.info("LevelClassifier loaded (cv_acc=%.1f%%)",
+                 _lvl_model.training_stats.get("cv_accuracy", 0) * 100)
+    else:
+        log.info("level_model.pkl not found — using source map + keywords")
 except ImportError:
     _cat_model = None
     _CAT_THRESHOLD = 0.45
+    _lvl_model = None
+    _LVL_THRESHOLD = 0.50
 
 
 def _classify_article(headline: str, summary: str, ai_cat: str | None = None) -> str:
@@ -397,6 +408,11 @@ def _determine_level(
         return ai_level
     if source in SOURCE_LEVELS:
         return SOURCE_LEVELS[source]
+    if _lvl_model:
+        text = f"{headline} {summary or ''}"
+        lvl, conf = _lvl_model.predict(text)
+        if conf >= _LVL_THRESHOLD:
+            return lvl
     kw = _detect_level_from_keywords(headline, summary)
     if kw:
         return kw

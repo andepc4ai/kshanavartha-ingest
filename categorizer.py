@@ -115,8 +115,8 @@ class CategoryClassifier:
             },
         }
         log.info(
-            "CategoryClassifier trained: n=%d  cv_acc=%.1f%%±%.1f%%",
-            len(texts), cv_acc * 100, cv_std * 100,
+            "%s trained: n=%d  cv_acc=%.1f%%±%.1f%%",
+            type(self).__name__, len(texts), cv_acc * 100, cv_std * 100,
         )
         return self.training_stats
 
@@ -148,16 +148,16 @@ class CategoryClassifier:
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump(self, f, protocol=4)
-        log.info("CategoryClassifier saved → %s", path)
+        log.info("%s saved → %s", type(self).__name__, path)
 
     @classmethod
     def load(cls, path: str = MODEL_PATH) -> "CategoryClassifier":
         with open(path, "rb") as f:
             obj = pickle.load(f)
         if not isinstance(obj, cls):
-            raise ValueError(f"Pickle at {path} is not a CategoryClassifier")
-        log.info("CategoryClassifier loaded ← %s (cv_acc=%.1f%%)",
-                 path, obj.training_stats.get("cv_accuracy", 0) * 100)
+            raise ValueError(f"Pickle at {path} is not a {cls.__name__}")
+        log.info("%s loaded ← %s (cv_acc=%.1f%%)",
+                 cls.__name__, path, obj.training_stats.get("cv_accuracy", 0) * 100)
         return obj
 
     @classmethod
@@ -168,5 +168,53 @@ class CategoryClassifier:
         try:
             return cls.load(path)
         except Exception as e:
-            log.warning("CategoryClassifier: could not load %s: %s", path, e)
+            log.warning("%s: could not load %s: %s", cls.__name__, path, e)
             return None
+
+
+# ─── Level classifier ─────────────────────────────────────────────────────────
+
+LEVELS = ["village", "mandal", "district", "state", "national"]
+LEVEL_CONFIDENCE_THRESHOLD = 0.50   # 5-class problem; require higher confidence
+LEVEL_MODEL_PATH = os.path.join(os.path.dirname(__file__), "level_model.pkl")
+
+
+class LevelClassifier(CategoryClassifier):
+    """
+    Predicts geographic level (village/mandal/district/state/national).
+
+    Inherits the same TF-IDF char n-gram + LogisticRegression pipeline.
+    Training data quality is high: national/state articles come from reliably
+    labelled source feeds; village/mandal from WhatsApp reporter profiles.
+
+    Usage (identical to CategoryClassifier):
+        model = LevelClassifier()
+        model.train(texts, labels)   # labels ∈ LEVELS
+        model.save("level_model.pkl")
+
+        model = LevelClassifier.load_or_none("level_model.pkl")
+        level, conf = model.predict(headline + " " + summary)
+    """
+
+    def predict(self, text: str) -> tuple[str, float]:
+        """Returns (level, confidence). Falls back to ("district", 0.0) if untrained."""
+        if not self.trained or self._pipeline is None:
+            return "district", 0.0
+        try:
+            probs = self._pipeline.predict_proba([text])[0]
+            idx = int(probs.argmax())
+            return str(self._pipeline.classes_[idx]), float(probs[idx])
+        except Exception as e:
+            log.warning("LevelClassifier.predict failed: %s", e)
+            return "district", 0.0
+
+    def save(self, path: str = LEVEL_MODEL_PATH) -> None:
+        super().save(path)
+
+    @classmethod
+    def load(cls, path: str = LEVEL_MODEL_PATH) -> "LevelClassifier":
+        return super().load(path)   # type: ignore[return-value]
+
+    @classmethod
+    def load_or_none(cls, path: str = LEVEL_MODEL_PATH) -> Optional["LevelClassifier"]:
+        return super().load_or_none(path)   # type: ignore[return-value]

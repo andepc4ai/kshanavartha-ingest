@@ -102,6 +102,54 @@ def load_examples_jsonl(jsonl_path: str) -> tuple[list[str], list[str]]:
     return texts, labels
 
 
+def load_level_examples_jsonl(jsonl_path: str) -> tuple[list[str], list[str]]:
+    """
+    Read training_data.jsonl and return (texts, labels) for level training.
+
+    Only includes entries with a known, non-empty `lvl` field. Entries
+    whose level was never resolved (empty string) are skipped — we'd rather
+    have fewer but reliable labels than noisy ones.
+    """
+    VALID = {"village", "mandal", "district", "state", "national"}
+    log.info("Loading JSONL level training data from %s", os.path.abspath(jsonl_path))
+    by_lvl: dict[str, list[str]] = {l: [] for l in VALID}
+    total = 0
+    with open(jsonl_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            lvl  = (entry.get("lvl") or "").strip().lower()
+            text = (entry.get("text") or "").strip()
+            if lvl not in VALID or len(text) < MIN_TEXT_LEN:
+                continue
+            by_lvl[lvl].append(text)
+            total += 1
+    log.info("Total JSONL entries with level: %d", total)
+
+    texts: list[str] = []
+    labels: list[str] = []
+    counts: dict[str, int] = {}
+    for lvl, examples in by_lvl.items():
+        random.seed(42)
+        random.shuffle(examples)
+        chosen = examples[:MAX_PER_CLASS]
+        texts.extend(chosen)
+        labels.extend([lvl] * len(chosen))
+        counts[lvl] = len(chosen)
+
+    log.info("Level training examples:")
+    for lvl, n in sorted(counts.items(), key=lambda x: -x[1]):
+        if n > 0:
+            log.info("  %-12s %d", lvl, n)
+    log.info("Total level training examples: %d", len(texts))
+    return texts, labels
+
+
 def load_examples(articles_path: str) -> tuple[list[str], list[str]]:
     """
     Read articles.json and return (texts, labels) for training.
@@ -160,7 +208,10 @@ def main() -> None:
     parser.add_argument("--articles", default=DEFAULT_ARTICLES,
                         help="Path to articles.json (fallback when --training-data not given)")
     parser.add_argument("--model", default="category_model.pkl",
-                        help="Output model path (default: category_model.pkl)")
+                        help="Output category model path (default: category_model.pkl)")
+    parser.add_argument("--level-model", default="level_model.pkl",
+                        help="Output level model path (default: level_model.pkl); "
+                             "only trained when --training-data is provided")
     parser.add_argument("--verbose", action="store_true",
                         help="Print full per-class metrics")
     args = parser.parse_args()
@@ -179,7 +230,10 @@ def main() -> None:
         log.error("scikit-learn not installed. Run: pip install scikit-learn")
         sys.exit(1)
 
-    from categorizer import CategoryClassifier, CONFIDENCE_THRESHOLD
+    from categorizer import (
+        CategoryClassifier, CONFIDENCE_THRESHOLD,
+        LevelClassifier, LEVEL_CONFIDENCE_THRESHOLD, LEVELS,
+    )
 
     if use_jsonl:
         log.info("Using JSONL training data (30-day compact store)")
@@ -215,12 +269,38 @@ def main() -> None:
     print()
 
     model.save(args.model)
-    print(f"OK Model saved -> {os.path.abspath(args.model)}")
+    print(f"OK category_model saved -> {os.path.abspath(args.model)}")
+
+    # ── Level model (only when JSONL available — needs lvl field) ─────────
+    if use_jsonl:
+        print()
+        lvl_texts, lvl_labels = load_level_examples_jsonl(args.training_data)
+        if len(lvl_texts) >= 50:
+            log.info("Training level classifier…")
+            lvl_model = LevelClassifier()
+            lvl_stats = lvl_model.train(lvl_texts, lvl_labels)
+            print()
+            print("=" * 55)
+            print(f"  LEVEL — Cross-val accuracy: {lvl_stats['cv_accuracy']*100:.1f}%"
+                  f" ± {lvl_stats['cv_std']*100:.1f}%")
+            print(f"  Training examples:  {lvl_stats['n_train']}")
+            print(f"  Confidence threshold: {LEVEL_CONFIDENCE_THRESHOLD}")
+            print()
+            print(f"  {'Level':<12}  {'Precision':>9}  {'Recall':>7}  {'F1':>5}  {'Support':>7}")
+            print("  " + "-" * 47)
+            for lvl, m in sorted(lvl_stats["per_class"].items(), key=lambda x: -x[1]["f1"]):
+                print(f"  {lvl:<12}  {m['precision']:>9.3f}  {m['recall']:>7.3f}  "
+                      f"{m['f1']:>5.3f}  {m['support']:>7}")
+            print("=" * 55)
+            print()
+            lvl_model.save(args.level_model)
+            print(f"OK level_model saved -> {os.path.abspath(args.level_model)}")
+        else:
+            log.warning("Not enough level-labelled entries (%d) — skipping level model", len(lvl_texts))
+
     print()
     print("Next steps:")
-    print("  1. Copy category_model.pkl to the kshanavartha-ingest folder.")
-    print("  2. The ingest pipeline picks it up automatically on next run.")
-    print("  3. Retrain monthly as more articles accumulate.")
+    print("  Both models are picked up automatically by ingest.py on next run.")
 
 
 if __name__ == "__main__":
