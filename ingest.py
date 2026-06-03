@@ -767,7 +767,7 @@ def _split_polished(raw: str) -> tuple[str | None, str, str | None]:
     # junk characters (►/🔥/etc.) that were in the source description.
     body = _sanitize_summary(body)
     title = _sanitize_summary(title) if title else title
-    return (title or None), body, ai_category
+    return (title or None), body, ai_category, ai_level
 
 
 def _looks_english(s: str) -> bool:
@@ -1571,6 +1571,10 @@ def parse_feed(feed: dict[str, str]) -> list[Article]:
             needs_resolve=is_gnews,
             video_id=video_id,
             is_short=is_short,
+            level=_determine_level(
+                mandal, village, feed["source"],
+                headline, raw_summary or "", None,
+            ),
         ))
     return items
 
@@ -1700,13 +1704,18 @@ def main() -> int:
                     pool, a.headline, a.summary, counters, MAX_TOTAL_GEMINI
                 )
                 if polished and len(polished) > 20:
-                    p_title, p_body, p_cat = _split_polished(polished)
+                    p_title, p_body, p_cat, p_level = _split_polished(polished)
                     if p_body:
                         summary_out = p_body
                     # Use the translated headline when the original is English
                     # (or always, if we got a clean Telugu title).
                     if p_title and (a.lang == "en" or _looks_english(a.headline)):
                         headline_out = p_title
+                    # Refine level using AI result (AI has full article context).
+                    a.level = _determine_level(
+                        a.mandal, a.village, a.source,
+                        headline_out, summary_out, p_level,
+                    )
                     # Category resolution — keyword detection on the AI-generated
                     # Telugu headline is the most reliable signal: short, clean
                     # Telugu, free of political noise from the raw RSS body.
@@ -1810,6 +1819,7 @@ def main() -> int:
                 "reporterId": a.reporterId,
                 "reporter": a.reporter,
                 "origin": a.origin,
+                "level": a.level,
             })
             new_articles_list.append(store[-1])   # track for FCM
             seen_ids.add(a.id)
@@ -2107,6 +2117,10 @@ def export_feed_to_r2(store: list[dict]) -> None:
             "village": d.get("village", ""),
             "source": d.get("source", ""),
             "link": d.get("link", ""),
+            "level": d.get("level") or _determine_level(
+                d.get("mandal", "all"), d.get("village"), d.get("source", ""),
+                d.get("headline", ""), d.get("summary", ""), None,
+            ),
             "image": d.get("image", ""),
             "audioUrl": d.get("audioUrl"),
             "audioSec": d.get("audioSec", 60),
@@ -2158,7 +2172,7 @@ def backfill_unpolished(store: list[dict], pool: GeminiKeyPool, counters: dict[s
             log.warning("backfill: all engines down, stopping at %d", polished_count)
             break
         if polished and len(polished) > 20:
-            p_title, p_body, p_cat = _split_polished(polished)
+            p_title, p_body, p_cat, p_level = _split_polished(polished)
             body = p_body or polished
             d["ai"] = True
             d["summary"] = body
@@ -2208,7 +2222,7 @@ def promote_community_reports(
                 pool, headline, detail, counters, MAX_TOTAL_GEMINI
             )
             if polished and len(polished) > 20:
-                p_title, p_body, p_cat = _split_polished(polished)
+                p_title, p_body, p_cat, p_level = _split_polished(polished)
                 if p_body:
                     te_body = p_body
                 if p_title:
@@ -2229,6 +2243,7 @@ def promote_community_reports(
                 "category": "village",
                 "mandal": "all",  # visible district-wide for the NTR pilot
                 "village": r.get("village") or "",
+                "level": "village" if r.get("village") else "mandal",
                 "source": "గ్రామ విలేకరి",
                 "sources": ["గ్రామ విలేకరి"],
                 "link": "",
