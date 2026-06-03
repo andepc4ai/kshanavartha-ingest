@@ -120,6 +120,11 @@ FEED_MIN = int(os.environ.get("FEED_MIN") or "250")    # minimum articles to pub
 # Cinema is capped independently so it never crowds out politics/farming.
 # Tune with CINEMA_MAX env var; 0 = no cap (not recommended).
 CINEMA_MAX = int(os.environ.get("CINEMA_MAX") or "8")
+# Per-run AI quota caps by geographic level. Village/mandal/district articles
+# get full quota; state + national are capped so they don't crowd out local
+# stories when the AI engines are limited. 0 = no cap.
+NATIONAL_AI_MAX = int(os.environ.get("NATIONAL_AI_MAX") or "5")
+STATE_AI_MAX    = int(os.environ.get("STATE_AI_MAX")    or "10")
 # Per-tier feed caps so no single category monopolises feed slots.
 # Politics articles can easily fill the entire feed (AP/TG news is ~60%
 # political). Caps keep the feed balanced across categories while staying
@@ -1802,12 +1807,16 @@ def main() -> int:
     gnews_enriched = 0
     feeds_ok = 0
     feeds_failed = 0
+    # Per-level AI quota tracking: village/mandal/district get unlimited;
+    # state and national are capped per run so local news always gets quota.
+    level_ai_counts: dict[str, int] = {"national": 0, "state": 0}
     counters = {
         "gemini_calls": 0, "sambanova_calls": 0,
         # AI engine success counts (tracked in article loop)
         "cerebras_ok": 0, "gemini_ok": 0, "sambanova_ok": 0,
         # Article skip reasons
-        "skip_english": 0, "skip_te_rich": 0, "skip_video": 0, "ai_fail": 0,
+        "skip_english": 0, "skip_te_rich": 0, "skip_video": 0,
+        "skip_level_cap": 0, "ai_fail": 0,
     }
 
     for feed in FEEDS:
@@ -1854,7 +1863,20 @@ def main() -> int:
             # YouTube items: headline + description are already the publisher's
             # own copy; no value in AI-rewriting it. Saves quota.
             skip_video = a.video_id is not None
-            if not skip_english and not skip_te_rich and not skip_video:
+            # Level-based AI cap: local news (village/mandal/district) gets
+            # unlimited quota; state/national are capped per run so they
+            # don't crowd out the hyper-local stories that matter most.
+            # a.level is already set from source-map + keyword pre-analysis.
+            skip_level_cap = False
+            if NATIONAL_AI_MAX > 0 and a.level == "national":
+                if level_ai_counts["national"] >= NATIONAL_AI_MAX:
+                    skip_level_cap = True
+                    counters["skip_level_cap"] = counters.get("skip_level_cap", 0) + 1
+            elif STATE_AI_MAX > 0 and a.level == "state":
+                if level_ai_counts["state"] >= STATE_AI_MAX:
+                    skip_level_cap = True
+                    counters["skip_level_cap"] = counters.get("skip_level_cap", 0) + 1
+            if not skip_english and not skip_te_rich and not skip_video and not skip_level_cap:
                 polished, _engine = polish_one(
                     pool, a.headline, a.summary, counters, MAX_TOTAL_GEMINI
                 )
@@ -1871,6 +1893,9 @@ def main() -> int:
                         a.mandal, a.village, a.source,
                         headline_out, summary_out, p_level,
                     )
+                    # Track per-level AI usage against the caps
+                    if a.level in level_ai_counts:
+                        level_ai_counts[a.level] += 1
                     # Category — three-tier cascade on polished text.
                     # Polished headline+summary is clean Telugu — ideal for
                     # both the sklearn model and the keyword fallback.
@@ -2650,24 +2675,34 @@ def _update_training_data(store: list[dict]) -> None:
         log.warning("training data: download error — %s", exc)
         return
 
-    # Add store entries whose ID is not yet in the file
+    # Add new entries; also update cat/lvl when admin corrected an existing article
     added = 0
+    updated = 0
     for art in store:
         art_id = art.get("id") or ""
-        if not art_id or art_id in existing:
+        if not art_id:
             continue
         headline = (art.get("headline") or "").strip()
         summary  = (art.get("summary")  or "").strip()
         text     = f"{headline} {summary}".strip()
         if len(text) < 20:
             continue
+        new_cat = (art.get("category") or "general").strip().lower()
+        new_lvl = (art.get("level")    or "").strip().lower()
         pub = art.get("publishedAt") or art.get("createdAt") or ""
         date_str = pub[:10] if len(pub) >= 10 else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if art_id in existing:
+            # Active learning: propagate admin corrections back to training data
+            old = existing[art_id]
+            if old.get("cat") != new_cat or old.get("lvl") != new_lvl:
+                existing[art_id] = {**old, "cat": new_cat, "lvl": new_lvl}
+                updated += 1
+            continue
         existing[art_id] = {
             "id":   art_id,
             "text": text,
-            "cat":  (art.get("category") or "general").strip().lower(),
-            "lvl":  (art.get("level")    or "").strip().lower(),
+            "cat":  new_cat,
+            "lvl":  new_lvl,
             "date": date_str,
         }
         added += 1
@@ -2688,8 +2723,8 @@ def _update_training_data(store: list[dict]) -> None:
         ContentType="application/jsonlines",
     )
     log.info(
-        "training data: updated — total=%d added=%d pruned=%d (%.1f KB)",
-        len(existing), added, pruned, len(payload) / 1024,
+        "training data: updated — total=%d added=%d updated=%d pruned=%d (%.1f KB)",
+        len(existing), added, updated, pruned, len(payload) / 1024,
     )
 
 
@@ -3408,6 +3443,7 @@ def _print_run_report(
     skip_eng = counters.get("skip_english", 0)
     skip_te  = counters.get("skip_te_rich", 0)
     skip_vid = counters.get("skip_video", 0)
+    skip_lvl = counters.get("skip_level_cap", 0)
     ai_fail  = counters.get("ai_fail", 0)
     print(f"\nAI PROCESSING  (of {new_count} new articles)")
     print(f"  AI polished    : {summarized}  "
@@ -3417,6 +3453,7 @@ def _print_run_report(
     print(f"  Native Telugu  : {skip_te}   (≥60 Te words — no AI needed, audio-eligible)")
     print(f"  English held   : {skip_eng}   (ENGLISH_POLISH not set)")
     print(f"  YouTube videos : {skip_vid}   (no AI for video items)")
+    print(f"  Level-capped   : {skip_lvl}   (national≤{NATIONAL_AI_MAX}, state≤{STATE_AI_MAX} per run)")
     print(f"  AI called, failed : {ai_fail}")
 
     def _pool_section(title: str, model: str, pool) -> None:

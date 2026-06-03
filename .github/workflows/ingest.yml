@@ -150,6 +150,11 @@ jobs:
           # ── Optional / advanced ──────────────────────────────────────────
           # GNEWS_RESOLVE_MAX: max Google News links to resolve per run (default 30)
           GNEWS_RESOLVE_MAX: ${{ vars.GNEWS_RESOLVE_MAX }}
+          # Level-based AI quota caps. Local news (village/mandal/district) is
+          # uncapped; state + national are capped to preserve quota for local stories.
+          # 0 = no cap. Override with GitHub Variables to tune without a deploy.
+          NATIONAL_AI_MAX: ${{ vars.NATIONAL_AI_MAX }}
+          STATE_AI_MAX: ${{ vars.STATE_AI_MAX }}
           # DATA_GOV_API_KEY: data.gov.in key for mandi (source dead — future use)
           DATA_GOV_API_KEY: ${{ secrets.DATA_GOV_API_KEY }}
         shell: bash
