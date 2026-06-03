@@ -27,3 +27,4 @@ dry_run_output.csv
 .vscode/
 *.DS_Store
 Thumbs.db
+category_model.pkl

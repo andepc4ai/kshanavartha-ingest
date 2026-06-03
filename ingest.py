@@ -278,6 +278,129 @@ FEEDS: list[dict[str, str]] = [
     #   ETV UCJi8M0hRKjz8SLPvJKEVTOg → removed per operator request 2026-05-26
 ]
 
+# ─── Category classifier ────────────────────────────────────────────────
+# Trained sklearn model. Falls back gracefully if pkl not found yet.
+try:
+    from categorizer import (
+        CategoryClassifier,
+        CONFIDENCE_THRESHOLD as _CAT_THRESHOLD,
+        MODEL_PATH as _CAT_MODEL_PATH,
+    )
+    _cat_model = CategoryClassifier.load_or_none(_CAT_MODEL_PATH)
+    if _cat_model:
+        log.info("CategoryClassifier loaded (cv_acc=%.1f%%)",
+                 _cat_model.training_stats.get("cv_accuracy", 0) * 100)
+    else:
+        log.info("category_model.pkl not found — using keyword detection")
+except ImportError:
+    _cat_model = None
+    _CAT_THRESHOLD = 0.45
+
+
+def _classify_article(headline: str, summary: str, ai_cat: str | None = None) -> str:
+    """Three-tier category classification.
+
+    1. sklearn model  — fast, local, no quota cost
+    2. AI p_cat       — used when model confidence is low
+    3. Keyword rules  — always-available fallback
+    """
+    text = f"{headline} {summary or ''}"
+    if _cat_model:
+        cat, conf = _cat_model.predict(text)
+        if conf >= _CAT_THRESHOLD:
+            return cat
+        # Low confidence: try AI p_cat
+        if ai_cat and ai_cat in _AI_VALID_CATEGORIES and ai_cat != 'general':
+            return ai_cat
+        # Return model's guess if it's specific (not general)
+        if cat != 'general':
+            return cat
+    else:
+        # No model: use AI p_cat if available
+        if ai_cat and ai_cat in _AI_VALID_CATEGORIES and ai_cat != 'general':
+            return ai_cat
+    # Final fallback: keyword rules
+    return detect_category(text)
+
+
+# ─── Geographic level detection ────────────────────────────────────────
+# SOURCE_LEVELS maps feed source label → default geographic level.
+SOURCE_LEVELS: dict[str, str] = {
+    "సాక్షి · ఏపీ":           "state",
+    "సాక్షి · తెలంగాణ":       "state",
+    "సాక్షి · జాతీయం":        "national",
+    "సాక్షి · వాణిజ్యం":      "national",
+    "BBC తెలుగు":             "national",
+    "NTV తెలుగు":             "state",
+    "TV9 తెలుగు":             "state",
+    "తెలుగుదేశం":             "state",
+    "TV9 సినిమా":             "national",
+    "మిర్చి9 సినిమా":         "national",
+    "123తెలుగు సినిమా":       "national",
+    "గూగుల్ వార్తలు":         "state",
+    "గూగుల్ · NTR జిల్లా":    "district",
+    "The Hindu · విజయవాడ":   "district",
+    "The Hindu · ఏపీ":        "state",
+    "The Hindu · తెలంగాణ":   "state",
+    "The Hindu · హైదరాబాద్": "district",
+    "BRK న్యూస్":             "district",
+    "BRK న్యూస్ · వీడియో":   "district",
+    "TV5 తెలుగు · వీడియో":   "state",
+    "స్టూడియో N · వీడియో":   "state",
+    "ఆంధ్రజ్యోతి · వీడియో":   "state",
+}
+_LEVEL_KW: dict[str, list[str]] = {
+    "national": [
+        "కేంద్రం", "కేంద్ర ప్రభుత్వం", "ప్రధానమంత్రి", "పార్లమెంట్",
+        "సుప్రీంకోర్టు", "లోక్‌సభ", "రాజ్యసభ",
+        "parliament", "prime minister", "supreme court", "lok sabha",
+    ],
+    "state": [
+        "ఆంధ్రప్రదేశ్", "తెలంగాణ", "రాష్ట్ర ప్రభుత్వం", "ముఖ్యమంత్రి",
+        "హైదరాబాద్", "అమరావతి", "గవర్నర్", "విధాన సభ",
+        "andhra pradesh", "telangana",
+    ],
+    "district": [
+        "ntr జిల్లా", "ntr district", "కృష్ణా జిల్లా", "జిల్లా కలెక్టర్",
+        "vijayawada", "విజయవాడ",
+    ],
+}
+_VALID_LEVELS = frozenset({"village", "mandal", "district", "state", "national"})
+
+
+def _detect_level_from_keywords(headline: str, summary: str) -> str | None:
+    """Detect level from keyword scan; None if no match."""
+    text = (headline + " " + (summary or "")).lower()
+    for lv in ("national", "state", "district"):
+        for kw in _LEVEL_KW[lv]:
+            if kw.lower() in text:
+                return lv
+    return None
+
+
+def _determine_level(
+    mandal: str,
+    village: str | None,
+    source: str,
+    headline: str,
+    summary: str,
+    ai_level: str | None,
+) -> str:
+    """Priority: village/mandal field > AI result > source map > keywords > district."""
+    if village:
+        return "village"
+    if mandal and mandal != "all":
+        return "mandal"
+    if ai_level and ai_level in _VALID_LEVELS:
+        return ai_level
+    if source in SOURCE_LEVELS:
+        return SOURCE_LEVELS[source]
+    kw = _detect_level_from_keywords(headline, summary)
+    if kw:
+        return kw
+    return "district"
+
+
 CATEGORY_RULES: list[tuple[str, list[str]]] = [
     # ── Rule ordering rationale ──────────────────────────────────────────
     # 1. Most-specific first: scheme names before generic farming keywords.
@@ -700,7 +823,13 @@ SUMMARY_PROMPT = (
     "sports (క్రీడలు, క్రికెట్) | "
     "cinema (సినిమా, నటులు, చిత్రాలు) | "
     "schemes (ప్రభుత్వ పథకాలు, సబ్సిడీలు, పెన్షన్లు) | "
-    "general (వేరే ఏ వర్గంలోనూ సరిగా సరిపోకపోతే)\n\n"
+    "general (వేరే ఏ వర్గంలోనూ సరిగా సరిపోకపోతే)\n"
+    "LEVEL: వార్త భౌగోళిక స్థాయి ఒక్క పదంలో: "
+    "village (నిర్దిష్ట గ్రామం/పట్టణం) | "
+    "mandal (నిర్దిష్ట మండలం) | "
+    "district (జిల్లా స్థాయి, ఉదా. NTR జిల్లా) | "
+    "state (రాష్ట్రం స్థాయి, ఉదా. ఆంధ్రప్రదేశ్/తెలంగాణ) | "
+    "national (జాతీయ స్థాయి)\n\n"
     "శీర్షిక: {headline}\nమూల వచనం: {summary}"
 )
 
@@ -711,7 +840,7 @@ _AI_VALID_CATEGORIES = frozenset({
 })
 
 
-def _split_polished(raw: str) -> tuple[str | None, str, str | None]:
+def _split_polished(raw: str) -> tuple[str | None, str, str | None, str | None]:
     """
     Parse the TITLE:/BODY:/CATEGORY: structured polish output.
     Returns (telugu_headline_or_None, summary, ai_category_or_None).
@@ -729,6 +858,7 @@ def _split_polished(raw: str) -> tuple[str | None, str, str | None]:
     title = None
     body_parts: list[str] = []
     ai_category: str | None = None
+    ai_level: str | None = None
     mode = None
     for line in raw.splitlines():
         s = line.strip()
@@ -746,6 +876,12 @@ def _split_polished(raw: str) -> tuple[str | None, str, str | None]:
             if cat in _AI_VALID_CATEGORIES:
                 ai_category = cat
             mode = "c"
+        elif su.startswith("LEVEL:"):
+            raw_lv = s[6:].strip().lower().strip("\"'").strip()
+            lv = raw_lv.split()[0] if raw_lv else ""
+            if lv in _VALID_LEVELS:
+                ai_level = lv
+            mode = "l"
         elif mode == "b":
             body_parts.append(s)
         elif mode == "t" and not title:
@@ -1289,6 +1425,7 @@ class Article:
     reporterId: str | None = None  # Reporter whitelist ID (e.g. rp_919154619599)
     reporter: dict | None = None  # Inlined reporter byline {name, village, mandal, title, avatar, phone_share}
     origin: str = "rss"  # "rss" | "whatsapp" | "telegram" (origin of the article)
+    level: str = "district"  # village | mandal | district | state | national
 
 
 def _best_body_text(entry) -> str:
@@ -1537,7 +1674,7 @@ def parse_feed(feed: dict[str, str]) -> list[Article]:
             raw_summary = cleaned or headline
             body = cleaned or headline
         text = f"{headline} {raw_summary}"
-        category = detect_category(text)
+        category = _classify_article(headline, raw_summary or "")
         mandal, village = detect_mandal(text)
         if hasattr(entry, "published_parsed") and entry.published_parsed:
             published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
@@ -1716,17 +1853,12 @@ def main() -> int:
                         a.mandal, a.village, a.source,
                         headline_out, summary_out, p_level,
                     )
-                    # Category resolution — keyword detection on the AI-generated
-                    # Telugu headline is the most reliable signal: short, clean
-                    # Telugu, free of political noise from the raw RSS body.
-                    # AI's own category string (p_cat) is NOT used — it
-                    # mis-classifies too often (cinema/finance → politics).
-                    # If nothing matches → stays "general". Better to under-
-                    # classify than to put cinema or finance under politics.
-                    if p_title:
-                        ai_headline_cat = detect_category(p_title)
-                        if ai_headline_cat != "general":
-                            category = ai_headline_cat  # clean headline wins
+                    # Category — three-tier cascade on polished text.
+                    # Polished headline+summary is clean Telugu — ideal for
+                    # both the sklearn model and the keyword fallback.
+                    category = _classify_article(
+                        headline_out, summary_out, p_cat
+                    )
                     summarized += 1
                     # Track which engine succeeded
                     if _engine == "cerebras":
