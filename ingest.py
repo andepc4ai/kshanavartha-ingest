@@ -1281,7 +1281,21 @@ def _is_live_video_headline(title: str) -> bool:
 # from ALL article text — Telugu characters and standard punctuation
 # (including Telugu danda ।) are preserved.
 _JUNK_CHARS_RE = re.compile(
-    r'[►➤▶▸▷❑▪◆◾⬛◼◻☐★☆☞✓✔✦✨⚡🔴🟢🟡🔵⚪⚫⏺▶️◀️🔥💥💡📺📱📢📣🚨🆕🆓🎬🎥]'
+    # Right/left arrows and bullets used as visual separators in RSS headlines
+    r'[►➤▶▸▷◄◀◁❮❯❱❰'
+    # Box/shape decorations
+    r'❑▪◆◾⬛◼◻☐▬▭▮▯'
+    # Stars, checkmarks, ticks used for engagement bait
+    r'★☆☞✓✔✅✗✘❌✦✨☑'
+    # Status circles/dots used as bullet alternatives
+    r'⚡🔴🟢🟡🔵🟠⚪⚫⏺🔘🔲🔳'
+    # Common emoji noise in news/social media posts
+    r'🔥💥💡📺📱📲📢📣📌📍🔔💬🗣🚨🆕🆓🎬🎥'
+    # Warning / info symbols
+    r'⚠️ℹ'
+    # Circled digit decorations ①-⑩
+    r'①②③④⑤⑥⑦⑧⑨⑩'
+    r']'
 )
 
 def _sanitize_summary(text: str) -> str:
