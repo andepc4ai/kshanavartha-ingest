@@ -48,10 +48,58 @@ _ALT = os.path.join(os.path.dirname(__file__), "..", "admin", "data", "articles.
 if not os.path.isfile(DEFAULT_ARTICLES) and os.path.isfile(_ALT):
     DEFAULT_ARTICLES = _ALT
 
-MAX_PER_CLASS = 250   # cap per category to keep classes balanced
-MIN_TEXT_LEN  = 40    # drop very short stubs
-CATEGORIES    = ["politics", "farming", "weather", "jobs",
-                 "village", "sports", "cinema", "schemes"]
+MAX_PER_CLASS  = 250   # cap per category to keep classes balanced
+MIN_TEXT_LEN   = 40    # drop very short stubs
+CATEGORIES     = ["politics", "farming", "weather", "jobs",
+                  "village", "sports", "cinema", "schemes"]
+CATEGORIES_ALL = CATEGORIES + ["general"]   # JSONL training includes 'general'
+
+
+def load_examples_jsonl(jsonl_path: str) -> tuple[list[str], list[str]]:
+    """
+    Read training_data.jsonl and return (texts, labels) for training.
+
+    Includes ALL categories (including 'general') and all origins (RSS +
+    WhatsApp). The classifier uses class_weight=balanced so 'general' does
+    not dominate. No ai/non-ai split needed — quality is already good.
+    """
+    log.info("Loading JSONL training data from %s", os.path.abspath(jsonl_path))
+    by_cat: dict[str, list[str]] = {c: [] for c in CATEGORIES_ALL}
+    total = 0
+    with open(jsonl_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            cat  = (entry.get("cat") or "general").strip().lower()
+            text = (entry.get("text") or "").strip()
+            if cat not in by_cat or len(text) < MIN_TEXT_LEN:
+                continue
+            by_cat[cat].append(text)
+            total += 1
+    log.info("Total JSONL entries: %d", total)
+
+    texts: list[str] = []
+    labels: list[str] = []
+    counts: dict[str, int] = {}
+    for cat, examples in by_cat.items():
+        random.seed(42)
+        random.shuffle(examples)
+        chosen = examples[:MAX_PER_CLASS]
+        texts.extend(chosen)
+        labels.extend([cat] * len(chosen))
+        counts[cat] = len(chosen)
+
+    log.info("Training examples per category:")
+    for cat, n in sorted(counts.items(), key=lambda x: -x[1]):
+        if n > 0:
+            log.info("  %-12s %d", cat, n)
+    log.info("Total training examples: %d", len(texts))
+    return texts, labels
 
 
 def load_examples(articles_path: str) -> tuple[list[str], list[str]]:
@@ -107,17 +155,21 @@ def load_examples(articles_path: str) -> tuple[list[str], list[str]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the KshanaVartha category classifier")
+    parser.add_argument("--training-data", default=None,
+                        help="Path to training_data.jsonl (preferred; 30-day compact store)")
     parser.add_argument("--articles", default=DEFAULT_ARTICLES,
-                        help="Path to articles.json")
+                        help="Path to articles.json (fallback when --training-data not given)")
     parser.add_argument("--model", default="category_model.pkl",
                         help="Output model path (default: category_model.pkl)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print full per-class metrics")
     args = parser.parse_args()
 
-    if not os.path.isfile(args.articles):
-        log.error("articles.json not found at: %s", args.articles)
-        log.error("Pass --articles /path/to/articles.json")
+    use_jsonl = args.training_data and os.path.isfile(args.training_data)
+    if not use_jsonl and not os.path.isfile(args.articles):
+        log.error("No training data found.")
+        log.error("  --training-data %s", args.training_data or "(not set)")
+        log.error("  --articles      %s", args.articles)
         sys.exit(1)
 
     # ── Check scikit-learn ────────────────────────────────────────────────
@@ -129,7 +181,12 @@ def main() -> None:
 
     from categorizer import CategoryClassifier, CONFIDENCE_THRESHOLD
 
-    texts, labels = load_examples(args.articles)
+    if use_jsonl:
+        log.info("Using JSONL training data (30-day compact store)")
+        texts, labels = load_examples_jsonl(args.training_data)
+    else:
+        log.info("Using articles.json (JSONL not available — fallback path)")
+        texts, labels = load_examples(args.articles)
 
     if len(texts) < 50:
         log.error("Not enough training data (found %d, need >= 50). "

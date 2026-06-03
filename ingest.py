@@ -108,6 +108,8 @@ MAX_PER_VIDEO_FEED = int(os.environ.get("MAX_PER_VIDEO_FEED") or "5")
 GNEWS_RESOLVE_MAX = int(os.environ.get("GNEWS_RESOLVE_MAX") or "30")
 MAX_TOTAL_GEMINI = int(os.environ.get("MAX_TOTAL_GEMINI") or "15")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS") or "14")
+TRAINING_RETENTION_DAYS = 30          # separate, longer window for ML training data
+_TRAINING_DATA_KEY = "training_data.jsonl"
 DELETE_BATCH_SIZE = 400     # Firestore batch limit is 500 — keep headroom
 # Audio (edge-tts → R2) is filled incrementally: a capped number of
 # articles get narrated per run so a 250-article backlog spreads over a
@@ -2037,6 +2039,10 @@ def main() -> int:
     except Exception as e:
         log.warning("article store save error: %s", e)
     try:
+        _update_training_data(store)
+    except Exception as e:
+        log.warning("training data update error: %s", e)
+    try:
         export_feed_to_r2(store)
     except Exception as e:
         log.warning("feed export error: %s", e)
@@ -2579,6 +2585,96 @@ def prune_old_articles(store: list[dict]) -> tuple[list[dict], int]:
     if dropped_ids:
         tts_r2.delete_media_bulk(dropped_ids)
     return kept, len(dropped_ids)
+
+
+def _update_training_data(store: list[dict]) -> None:
+    """
+    Maintain a compact 30-day JSONL on R2 (training_data.jsonl) for ML training.
+    Each line: {"id":…, "text":…, "cat":…, "lvl":…, "date":…}
+
+    Called after save_articles() every run. Downloads the existing file, adds
+    any store entries whose ID isn't already present, prunes entries older than
+    TRAINING_RETENTION_DAYS, and uploads back. All categories (including
+    'general') and all origins (RSS + WhatsApp) are stored — the classifier
+    uses class_weight=balanced so the general class doesn't dominate.
+
+    First run (file missing on R2): bootstraps from the entire current store.
+    """
+    if not tts_r2.r2_enabled():
+        return
+
+    from botocore.exceptions import ClientError  # noqa: PLC0415
+    client = tts_r2._r2_client()
+    bucket = tts_r2.R2_BUCKET
+    cutoff_str = (
+        datetime.now(timezone.utc) - timedelta(days=TRAINING_RETENTION_DAYS)
+    ).strftime("%Y-%m-%d")
+
+    # Download existing entries (id → compact dict)
+    existing: dict[str, dict] = {}
+    try:
+        resp = client.get_object(Bucket=bucket, Key=_TRAINING_DATA_KEY)
+        for raw in resp["Body"].read().decode("utf-8").splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+                existing[entry["id"]] = entry
+            except (json.JSONDecodeError, KeyError):
+                pass
+        log.info("training data: loaded %d existing entries", len(existing))
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            log.info("training data: not found on R2 — bootstrapping from store")
+        else:
+            log.warning("training data: download error — %s", exc)
+            return
+    except Exception as exc:
+        log.warning("training data: download error — %s", exc)
+        return
+
+    # Add store entries whose ID is not yet in the file
+    added = 0
+    for art in store:
+        art_id = art.get("id") or ""
+        if not art_id or art_id in existing:
+            continue
+        headline = (art.get("headline") or "").strip()
+        summary  = (art.get("summary")  or "").strip()
+        text     = f"{headline} {summary}".strip()
+        if len(text) < 20:
+            continue
+        pub = art.get("publishedAt") or art.get("createdAt") or ""
+        date_str = pub[:10] if len(pub) >= 10 else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        existing[art_id] = {
+            "id":   art_id,
+            "text": text,
+            "cat":  (art.get("category") or "general").strip().lower(),
+            "lvl":  (art.get("level")    or "").strip().lower(),
+            "date": date_str,
+        }
+        added += 1
+
+    # Prune entries older than TRAINING_RETENTION_DAYS
+    before_prune = len(existing)
+    existing = {k: v for k, v in existing.items() if (v.get("date") or "9999") >= cutoff_str}
+    pruned = before_prune - len(existing)
+
+    # Upload back
+    payload = "\n".join(
+        json.dumps(e, ensure_ascii=False) for e in existing.values()
+    ).encode("utf-8")
+    client.put_object(
+        Bucket=bucket,
+        Key=_TRAINING_DATA_KEY,
+        Body=payload,
+        ContentType="application/jsonlines",
+    )
+    log.info(
+        "training data: updated — total=%d added=%d pruned=%d (%.1f KB)",
+        len(existing), added, pruned, len(payload) / 1024,
+    )
 
 
 # ─── Live Data (Alerts) ──────────────────────────────────

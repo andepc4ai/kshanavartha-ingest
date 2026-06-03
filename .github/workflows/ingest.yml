@@ -67,9 +67,11 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set +e   # training failure must not abort the ingest run
+          # Download the compact 30-day training store (~2.6 MB vs 29 MB articles.json)
           python - <<'PYEOF'
-          import boto3, gzip, json, os, sys
+          import boto3, os, sys
           from botocore.config import Config
+          from botocore.exceptions import ClientError
           try:
               client = boto3.client(
                   "s3",
@@ -79,21 +81,25 @@ jobs:
                   config=Config(signature_version="s3v4"),
                   region_name="auto",
               )
-              resp = client.get_object(Bucket="kv-audio", Key="articles.json")
+              resp = client.get_object(Bucket="kv-audio", Key="training_data.jsonl")
               body = resp["Body"].read()
-              if resp.get("ContentEncoding") == "gzip":
-                  body = gzip.decompress(body)
-              with open("/tmp/training_articles.json", "wb") as f:
+              with open("/tmp/training_data.jsonl", "wb") as f:
                   f.write(body)
-              n = len(json.loads(body).get("articles", []))
-              print(f"Downloaded articles.json ({n} articles)")
-          except Exception as e:
-              print(f"WARNING: could not download articles.json: {e}", file=sys.stderr)
+              n = sum(1 for l in body.decode("utf-8").splitlines() if l.strip())
+              print(f"Downloaded training_data.jsonl ({n} entries, {len(body)//1024} KB)")
+          except ClientError as e:
+              if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+                  print("training_data.jsonl not on R2 yet — first run or bootstrap pending", file=sys.stderr)
+              else:
+                  print(f"WARNING: could not download training_data.jsonl: {e}", file=sys.stderr)
               sys.exit(0)   # non-fatal — ingest will use keyword fallback
+          except Exception as e:
+              print(f"WARNING: could not download training_data.jsonl: {e}", file=sys.stderr)
+              sys.exit(0)
           PYEOF
-          if [ -f /tmp/training_articles.json ]; then
+          if [ -f /tmp/training_data.jsonl ]; then
             python train_categorizer.py \
-              --articles /tmp/training_articles.json \
+              --training-data /tmp/training_data.jsonl \
               --model category_model.pkl \
             && echo "Category classifier trained OK" \
             || echo "WARNING: training failed — ingest will use keyword fallback"
