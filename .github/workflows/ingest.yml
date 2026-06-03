@@ -42,6 +42,63 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # ── Category classifier ─────────────────────────────────────────────
+      # Train the sklearn TF-IDF + LogisticRegression classifier once per
+      # calendar day using articles.json from R2 as training data.
+      # Cached by date so the 48 daily runs only train once (~25s each day).
+      # If the cache hit or training succeeds, category_model.pkl is present
+      # and ingest.py picks it up automatically. If training fails for any
+      # reason, ingest gracefully falls back to keyword detection.
+      - name: Set training date key
+        run: echo "TRAIN_DATE=$(date -u '+%Y-%m-%d')" >> "$GITHUB_ENV"
+
+      - name: Restore cached category model
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: category_model.pkl
+          key: category-model-${{ env.TRAIN_DATE }}
+
+      - name: Train category classifier
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set +e   # training failure must not abort the ingest run
+          python - <<'PYEOF'
+          import boto3, gzip, json, os, sys
+          from botocore.config import Config
+          try:
+              client = boto3.client(
+                  "s3",
+                  endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+                  aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
+                  aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
+                  config=Config(signature_version="s3v4"),
+                  region_name="auto",
+              )
+              resp = client.get_object(Bucket="kv-audio", Key="articles.json")
+              body = resp["Body"].read()
+              if resp.get("ContentEncoding") == "gzip":
+                  body = gzip.decompress(body)
+              with open("/tmp/training_articles.json", "wb") as f:
+                  f.write(body)
+              n = len(json.loads(body).get("articles", []))
+              print(f"Downloaded articles.json ({n} articles)")
+          except Exception as e:
+              print(f"WARNING: could not download articles.json: {e}", file=sys.stderr)
+              sys.exit(0)   # non-fatal — ingest will use keyword fallback
+          PYEOF
+          if [ -f /tmp/training_articles.json ]; then
+            python train_categorizer.py \
+              --articles /tmp/training_articles.json \
+              --model category_model.pkl \
+            && echo "Category classifier trained OK" \
+            || echo "WARNING: training failed — ingest will use keyword fallback"
+          fi
+
       - name: Run ingest
         env:
           # ── AI engines (priority: Cerebras → Gemini → SambaNova) ────────
