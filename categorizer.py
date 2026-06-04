@@ -35,7 +35,7 @@ CONFIDENCE_THRESHOLD = 0.45
 
 CATEGORIES = [
     "politics", "farming", "weather", "jobs",
-    "village", "sports", "cinema", "schemes", "general",
+    "health", "village", "sports", "cinema", "schemes", "general",
 ]
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "category_model.pkl")

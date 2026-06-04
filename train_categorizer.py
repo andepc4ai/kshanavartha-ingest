@@ -51,7 +51,7 @@ if not os.path.isfile(DEFAULT_ARTICLES) and os.path.isfile(_ALT):
 MAX_PER_CLASS  = 250   # cap per category to keep classes balanced
 MIN_TEXT_LEN   = 40    # drop very short stubs
 CATEGORIES     = ["politics", "farming", "weather", "jobs",
-                  "village", "sports", "cinema", "schemes"]
+                  "health", "village", "sports", "cinema", "schemes"]
 CATEGORIES_ALL = CATEGORIES + ["general"]   # JSONL training includes 'general'
 
 

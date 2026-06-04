@@ -465,6 +465,22 @@ CATEGORY_RULES: list[tuple[str, list[str]]] = [
         "job", "recruit", "vacancy", "notification", "appsc", "tspsc", "ssc",
         "upsc", "constable", "ssb", "exam result", "interview",
     ]),
+    # ── health: BEFORE village ────────────────────────────────────────────
+    # Health articles mention hospitals, doctors, diseases. Placing before
+    # village prevents "ఆసుపత్రి" (hospital) from landing in the village
+    # bucket — health is a more precise classification.
+    ("health",   [
+        # Telugu — core medical terms
+        "ఆరోగ్యం", "ఆసుపత్రి", "వైద్యం", "వైద్యుడు", "డాక్టర్",
+        "వ్యాధి", "మందులు", "చికిత్స", "వ్యాక్సిన్", "టీకా",
+        "డెంగ్యూ", "మలేరియా", "కోవిడ్", "వైరస్", "జ్వరం",
+        "వైద్య కళాశాల", "సర్జరీ", "ఆపరేషన్", "రక్తదానం",
+        "ఐసీయూ", "అంబులెన్స్", "మెడికల్",
+        # English
+        "health", "hospital", "doctor", "disease", "medicine", "vaccine",
+        "dengue", "malaria", "covid", "virus", "surgery", "treatment",
+        "AIIMS", "PHC", "ICU", "ambulance", "blood donation", "health camp",
+    ]),
     # ── village: BEFORE politics ─────────────────────────────────────────
     # Local-life stories (incidents, wildlife, community events, local govt)
     # should be village even if a politician is mentioned in passing.
@@ -480,10 +496,9 @@ CATEGORY_RULES: list[tuple[str, list[str]]] = [
         "ప్రమాదం", "రోడ్డు ప్రమాదం", "మృతి", "గాయాలు",           # accidents
         "అగ్నిప్రమాదం", "మంటలు",                                   # fire
         "దొంగతనం", "దోపిడీ", "హత్య",                               # crime
-        "ఆసుపత్రి", "వైద్యం",                                       # health
         # English
         "village", "panchayat", "gram", "sarpanch", "ward sachivalayam",
-        "accident", "fire", "snake", "theft", "hospital",
+        "accident", "fire", "snake", "theft",
     ]),
     # ── cinema: BEFORE politics ──────────────────────────────────────────
     # Cinema must be checked before politics. Many entertainment articles
@@ -842,6 +857,7 @@ SUMMARY_PROMPT = (
     "farming (వ్యవసాయం, రైతులు, పంటలు, మండీ ధరలు) | "
     "weather (వాతావరణం, వర్షం, తుఫాన్) | "
     "jobs (ఉద్యోగాలు, నోటిఫికేషన్లు, పరీక్షలు) | "
+    "health (ఆరోగ్యం, ఆసుపత్రి, వైద్యం, వ్యాధులు, వ్యాక్సిన్లు) | "
     "village (గ్రామాలు, స్థానిక సంఘటనలు, ప్రమాదాలు, నేరాలు) | "
     "sports (క్రీడలు, క్రికెట్) | "
     "cinema (సినిమా, నటులు, చిత్రాలు) | "
@@ -859,7 +875,7 @@ SUMMARY_PROMPT = (
 # Valid category values the AI may return — must match CATEGORY_RULES keys + general.
 _AI_VALID_CATEGORIES = frozenset({
     "politics", "farming", "weather", "jobs", "village",
-    "sports", "cinema", "schemes", "general",
+    "health", "sports", "cinema", "schemes", "general",
 })
 
 
@@ -2157,7 +2173,7 @@ def _is_telugu_feed_item(d: dict) -> bool:
 # Unknown categories fall into tier 2 (general).
 _FEED_TIER: dict[str, int] = {
     "politics": 0, "schemes": 0,
-    "farming": 1, "weather": 1, "jobs": 1, "village": 1,
+    "farming": 1, "weather": 1, "jobs": 1, "village": 1, "health": 1,
     "sports": 2, "general": 2,
     "cinema": 3,
 }
@@ -3309,7 +3325,7 @@ def notify_new_articles(db: firestore.Client, store: list[dict],
 
     Design (confirmed 2026-05):
     - One notification per run — avoids notification fatigue, free-tier safe.
-    - Only Tier 0 (politics, schemes) + Tier 1 (farming, weather, jobs, village)
+    - Only Tier 0 (politics, schemes) + Tier 1 (farming, weather, jobs, village, health)
       qualify. Cinema/sports/general are not urgent enough.
     - 3-hour gap (tunable via NOTIFICATION_GAP_HOURS) prevents spam even when
       many articles land at once.
