@@ -2689,12 +2689,12 @@ def _update_training_data(store: list[dict]) -> None:
         log.warning("training data: download error — %s", exc)
         return
 
-    # Add new entries; also update cat/lvl when admin corrected an existing article
+    # Only human-verified articles go into training data — no pipeline-guessed labels
     added = 0
     updated = 0
     for art in store:
         art_id = art.get("id") or ""
-        if not art_id:
+        if not art_id or not art.get("verified"):
             continue
         headline = (art.get("headline") or "").strip()
         summary  = (art.get("summary")  or "").strip()
