@@ -138,6 +138,15 @@ SPORTS_MAX        = int(os.environ.get("SPORTS_MAX")        or "75")
 # by tier (politics first), but newer buckets always beat older buckets so a
 # recent general article outranks an old politics article.
 FEED_BUCKET_HOURS = int(os.environ.get("FEED_BUCKET_HOURS") or "1")
+# Rolling window for feed.json. Only articles published in the last N hours
+# are included in the live feed. Older articles live in daily archives.
+FEED_WINDOW_HOURS = int(os.environ.get("FEED_WINDOW_HOURS") or "24")
+# Number of daily archive snapshots (feed_vYYYYMMDD.json) to keep on R2.
+# Oldest archives beyond this count are pruned each run.
+ARCHIVE_KEEP_DAYS = int(os.environ.get("ARCHIVE_KEEP_DAYS") or "5")
+# IST timezone and 6 AM boundary for daily archival.
+IST = timezone(timedelta(hours=5, minutes=30))
+ARCHIVE_HOUR_IST = 6
 # Minimum hours between push notifications. Set via NOTIFICATION_GAP_HOURS
 # GitHub Variable. Default 3 h → max 8 pushes/day even on a fast news day.
 NOTIFICATION_GAP_HOURS = int(os.environ.get("NOTIFICATION_GAP_HOURS") or "3")
@@ -2114,6 +2123,10 @@ def main() -> int:
     except Exception as e:
         log.warning("training data update error: %s", e)
     try:
+        archive_daily_feed_if_needed(store)
+    except Exception as e:
+        log.warning("archive error: %s", e)
+    try:
         export_feed_to_r2(store)
     except Exception as e:
         log.warning("feed export error: %s", e)
@@ -2177,6 +2190,54 @@ _FEED_TIER: dict[str, int] = {
     "sports": 2, "general": 2,
     "cinema": 3,
 }
+
+
+def _pub_dt(d: dict):
+    """Parse publishedAt (or createdAt fallback) → aware datetime, or None."""
+    raw = d.get("publishedAt") or d.get("createdAt") or ""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _after_cutoff(d: dict, cutoff_dt) -> bool:
+    """True if article was published at or after cutoff_dt."""
+    dt = _pub_dt(d)
+    return dt is not None and dt >= cutoff_dt
+
+
+def _format_article_for_feed(d: dict) -> dict:
+    """Produce the public-facing dict for one article (same shape as feed.json)."""
+    return {
+        "id": d.get("id", ""),
+        "headline": d.get("headline", ""),
+        "summary": d.get("summary", ""),
+        "category": d.get("category", "general"),
+        "mandal": d.get("mandal", "all"),
+        "village": d.get("village", ""),
+        "source": d.get("source", ""),
+        "link": d.get("link", ""),
+        "level": d.get("level") or _determine_level(
+            d.get("mandal", "all"), d.get("village"), d.get("source", ""),
+            d.get("headline", ""), d.get("summary", ""), None,
+        ),
+        "image": d.get("image", ""),
+        "audioUrl": d.get("audioUrl"),
+        "audioSec": d.get("audioSec", 60),
+        "color": d.get("color", "#7C2D12"),
+        "ai": bool(d.get("ai", False)),
+        "publishedAt": d.get("publishedAt"),
+        "videoId": d.get("videoId"),
+        "isShort": bool(d.get("isShort")),
+        "featured": bool(d.get("featured")),
+        "featuredUntil": d.get("featuredUntil"),
+        "sponsored": bool(d.get("sponsored")),
+        "sponsoredUntil": d.get("sponsoredUntil"),
+        "sponsoredAdvertiser": d.get("sponsoredAdvertiser") or "",
+    }
 
 
 def _build_feed_combined(store: list[dict]) -> tuple[list[dict], dict]:
@@ -2273,7 +2334,9 @@ def _feed_article_ids(store: list[dict]) -> set:
     Uses _build_feed_combined() so audio synthesis targets exactly the same
     articles that will be published. No R2 call.
     """
-    combined, _ = _build_feed_combined(store)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=FEED_WINDOW_HOURS)
+    recent = [d for d in store if _after_cutoff(d, cutoff)]
+    combined, _ = _build_feed_combined(recent)
     return {d["id"] for d in combined if d.get("id")}
 
 
@@ -2298,13 +2361,17 @@ def export_feed_to_r2(store: list[dict]) -> None:
         log.info("feed export skipped — R2 not configured")
         return
 
-    combined, stats = _build_feed_combined(store)
+    # Rolling 24h window: only recent articles enter the live feed.
+    # Older articles are preserved in articles.json for archive building.
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=FEED_WINDOW_HOURS)
+    recent = [d for d in store if _after_cutoff(d, cutoff)]
+    combined, stats = _build_feed_combined(recent)
 
     log.info(
-        "feed: %d articles -> R2  "
+        "feed: %d articles -> R2 (last %dh)  "
         "[politics/schemes=%d(cap=%d)  farming/etc=%d(cap=%d)  "
         "sports/general=%d(cap=%d)  cinema=%d(cap=%d)]  non-Telugu excluded=%d",
-        len(combined),
+        len(combined), FEED_WINDOW_HOURS,
         stats["tier0"],  POLITICS_MAX,
         stats["tier1"],  FARMING_MAX,
         stats["tier2"],  SPORTS_MAX,
@@ -2312,46 +2379,63 @@ def export_feed_to_r2(store: list[dict]) -> None:
         stats["skipped_non_te"],
     )
 
-    out: list[dict] = []
-    for d in combined:
-        out.append({
-            "id": d.get("id", ""),
-            "headline": d.get("headline", ""),
-            "summary": d.get("summary", ""),
-            # audioScript removed — identical to summary; app plays audioUrl MP3
-            # lang removed     — feed is always Telugu; app has no lang display logic
-            # createdAt removed — app never displays it; only used as ingest sort fallback
-            "category": d.get("category", "general"),
-            "mandal": d.get("mandal", "all"),
-            "village": d.get("village", ""),
-            "source": d.get("source", ""),
-            "link": d.get("link", ""),
-            "level": d.get("level") or _determine_level(
-                d.get("mandal", "all"), d.get("village"), d.get("source", ""),
-                d.get("headline", ""), d.get("summary", ""), None,
-            ),
-            "image": d.get("image", ""),
-            "audioUrl": d.get("audioUrl"),
-            "audioSec": d.get("audioSec", 60),
-            "color": d.get("color", "#7C2D12"),
-            "ai": bool(d.get("ai", False)),
-            "publishedAt": d.get("publishedAt"),
-            "videoId": d.get("videoId"),
-            "isShort": bool(d.get("isShort")),
-            # Editorial + sponsored fields. The client renders featured
-            # items in a pinned section at top of feed; sponsored items
-            # get a mandatory "ప్రాయోజిత ప్రకటన" disclosure banner.
-            # Both auto-expire via cleanup_existing_articles when their
-            # *Until timestamp passes.
-            "featured": bool(d.get("featured")),
-            "featuredUntil": d.get("featuredUntil"),
-            "sponsored": bool(d.get("sponsored")),
-            "sponsoredUntil": d.get("sponsoredUntil"),
-            "sponsoredAdvertiser": d.get("sponsoredAdvertiser") or "",
-        })
+    out = [_format_article_for_feed(d) for d in combined]
     log.info("feed: %d Telugu articles published, %d non-Telugu excluded",
              len(out), stats["skipped_non_te"])
     feed_r2.upload_feed(out)
+
+
+def archive_daily_feed_if_needed(store: list[dict]) -> None:
+    """Create a daily archive snapshot (feed_vYYYYMMDD.json) once per day at 6 AM IST.
+
+    Archive window: yesterday 6 AM IST → today 6 AM IST.
+    Archive name:   feed_v{YYYYMMDD}.json where YYYYMMDD = today (IST) = the END of the window.
+    Guard:          HEAD-check on R2 so multiple runs after 6 AM only archive once.
+    Prune:          Archives older than ARCHIVE_KEEP_DAYS are deleted from R2.
+
+    Called before export_feed_to_r2 so the archive captures the full previous day
+    before the live feed is refreshed.
+    """
+    import feed_r2
+    if not feed_r2.r2_enabled():
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(IST)
+
+    # Today's 6 AM IST boundary in UTC.
+    today_6am_ist = now_ist.replace(hour=ARCHIVE_HOUR_IST, minute=0, second=0, microsecond=0)
+    today_6am_utc = today_6am_ist.astimezone(timezone.utc)
+
+    if now_utc < today_6am_utc:
+        # Before today's 6 AM IST — nothing to archive yet.
+        return
+
+    date_str = now_ist.strftime("%Y%m%d")
+
+    if feed_r2.archive_exists(date_str):
+        log.info("archive: feed_v%s.json already exists — skipping", date_str)
+    else:
+        # Build archive: Telugu articles published in [yesterday 6AM IST, today 6AM IST).
+        yesterday_6am_utc = today_6am_utc - timedelta(days=1)
+        def _in_window(d: dict) -> bool:
+            dt = _pub_dt(d)
+            return dt is not None and yesterday_6am_utc <= dt < today_6am_utc
+
+        windowed = [d for d in store if _is_telugu_feed_item(d) and _in_window(d)]
+        combined, _ = _build_feed_combined(windowed)
+        out = [_format_article_for_feed(d) for d in combined]
+        if out:
+            url = feed_r2.upload_archive(out, date_str)
+            if url:
+                log.info("archive: feed_v%s.json created — %d articles", date_str, len(out))
+        else:
+            log.info("archive: feed_v%s.json — 0 Telugu articles in window, skipping upload", date_str)
+
+    # Prune archives older than ARCHIVE_KEEP_DAYS.
+    for days_ago in range(ARCHIVE_KEEP_DAYS + 1, ARCHIVE_KEEP_DAYS + 8):
+        old_date = (now_ist - timedelta(days=days_ago)).strftime("%Y%m%d")
+        feed_r2.delete_archive(old_date)
 
 
 def backfill_unpolished(store: list[dict], pool: GeminiKeyPool, counters: dict[str, int]) -> int:

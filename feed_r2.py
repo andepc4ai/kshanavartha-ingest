@@ -61,6 +61,34 @@ def _r2_client():
     )
 
 
+def _upload_json_gzip(key: str, articles: list[dict], cache_control: str = "no-cache") -> str | None:
+    """Internal: gzip-encode articles JSON and PUT to R2 under `key`. Returns public URL or None."""
+    try:
+        payload = json.dumps(
+            {"articles": articles, "count": len(articles)},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        compressed = gzip.compress(payload, compresslevel=9)
+        _r2_client().put_object(
+            Bucket=R2_BUCKET,
+            Key=key,
+            Body=compressed,
+            ContentType="application/json; charset=utf-8",
+            ContentEncoding="gzip",
+            CacheControl=cache_control,
+        )
+        url = f"{R2_PUBLIC_URL}/{key}"
+        log.info(
+            "uploaded → %s — %d articles (%d KB raw → %d KB gzip)",
+            url, len(articles), len(payload) // 1024, len(compressed) // 1024,
+        )
+        return url
+    except Exception as e:
+        log.warning("upload failed for key=%s: %s", key, e)
+        return None
+
+
 def upload_feed(articles: list[dict]) -> str | None:
     """
     Serialize `articles` to JSON and upload to R2 as feed.json.
@@ -71,30 +99,42 @@ def upload_feed(articles: list[dict]) -> str | None:
     if not r2_enabled():
         log.info("feed export skipped — R2 not configured")
         return None
-    try:
-        payload = json.dumps(
-            {"articles": articles, "count": len(articles)},
-            ensure_ascii=False,            # keep Telugu readable
-            separators=(",", ":"),
-        ).encode("utf-8")
-        # Gzip before upload: ~600 KB raw JSON → ~120 KB compressed (~80% saving).
-        # HTTP clients (Android WebView fetch, browsers) auto-decompress
-        # Content-Encoding: gzip transparently — no app-side changes needed.
-        compressed = gzip.compress(payload, compresslevel=9)
-        _r2_client().put_object(
-            Bucket=R2_BUCKET,
-            Key=FEED_KEY,
-            Body=compressed,
-            ContentType="application/json; charset=utf-8",
-            ContentEncoding="gzip",
-            CacheControl="no-cache",
-        )
-        url = f"{R2_PUBLIC_URL}/{FEED_KEY}"
-        log.info(
-            "feed exported — %d articles → %s (%d KB raw → %d KB gzip)",
-            len(articles), url, len(payload) // 1024, len(compressed) // 1024,
-        )
-        return url
-    except Exception as e:
-        log.warning("feed export failed: %s", e)
+    return _upload_json_gzip(FEED_KEY, articles, cache_control="no-cache")
+
+
+def upload_archive(articles: list[dict], date_str: str) -> str | None:
+    """
+    Upload a daily archive snapshot to R2 as feed_v{date_str}.json (e.g. feed_v20260604.json).
+    Archives are immutable historical snapshots so Cache-Control is long (24h).
+    Returns the public URL or None on failure.
+    """
+    if not r2_enabled():
+        log.info("archive upload skipped — R2 not configured")
         return None
+    key = f"feed_v{date_str}.json"
+    return _upload_json_gzip(key, articles, cache_control="max-age=86400")
+
+
+def archive_exists(date_str: str) -> bool:
+    """
+    Returns True if feed_v{date_str}.json already exists in R2 (HEAD check).
+    Used to skip re-archiving if ingest runs multiple times after 6 AM.
+    """
+    if not r2_enabled():
+        return False
+    try:
+        _r2_client().head_object(Bucket=R2_BUCKET, Key=f"feed_v{date_str}.json")
+        return True
+    except Exception:
+        return False
+
+
+def delete_archive(date_str: str) -> None:
+    """Delete feed_v{date_str}.json from R2. Best-effort, never raises."""
+    if not r2_enabled():
+        return
+    try:
+        _r2_client().delete_object(Bucket=R2_BUCKET, Key=f"feed_v{date_str}.json")
+        log.info("archive pruned: feed_v%s.json", date_str)
+    except Exception as e:
+        log.warning("archive prune failed for %s: %s", date_str, e)
