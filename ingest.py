@@ -107,7 +107,7 @@ MAX_PER_VIDEO_FEED = int(os.environ.get("MAX_PER_VIDEO_FEED") or "5")
 # per run (3 HTTP calls each) so it can't blow the 15-min cron budget.
 GNEWS_RESOLVE_MAX = int(os.environ.get("GNEWS_RESOLVE_MAX") or "30")
 MAX_TOTAL_GEMINI = int(os.environ.get("MAX_TOTAL_GEMINI") or "15")
-RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS") or "14")
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS") or "10")
 TRAINING_RETENTION_DAYS = 30          # separate, longer window for ML training data
 _TRAINING_DATA_KEY = "training_data.jsonl"
 DELETE_BATCH_SIZE = 400     # Firestore batch limit is 500 — keep headroom
