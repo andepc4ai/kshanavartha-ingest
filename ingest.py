@@ -115,38 +115,25 @@ DELETE_BATCH_SIZE = 400     # Firestore batch limit is 500 — keep headroom
 # articles get narrated per run so a 250-article backlog spreads over a
 # few cron cycles instead of one slow run.
 AUDIO_MAX_PER_RUN = int(os.environ.get("AUDIO_MAX_PER_RUN") or "30")
-FEED_MAX = int(os.environ.get("FEED_MAX") or "500")    # public feed.json size cap (hard ceiling)
-FEED_MIN = int(os.environ.get("FEED_MIN") or "250")    # minimum articles to publish; overflow fills the gap
-# Cinema is capped independently so it never crowds out politics/farming.
-# Tune with CINEMA_MAX env var; 0 = no cap (not recommended).
-CINEMA_MAX = int(os.environ.get("CINEMA_MAX") or "8")
+FEED_MAX = int(os.environ.get("FEED_MAX") or "2000")   # public feed.json size cap — high ceiling, midnight window limits naturally
+FEED_MIN = int(os.environ.get("FEED_MIN") or "50")     # minimum articles; if today < 50, pad with yesterday's overflow
+# Cinema is capped so it never floods the feed regardless of volume.
+# 0 = no cap. Other Tier 2 categories (health, sports) are uncapped by default.
+CINEMA_MAX = int(os.environ.get("CINEMA_MAX") or "30")
 # Per-run AI quota caps by geographic level. Village/mandal/district articles
 # get full quota; state + national are capped so they don't crowd out local
 # stories when the AI engines are limited. 0 = no cap.
 NATIONAL_AI_MAX = int(os.environ.get("NATIONAL_AI_MAX") or "5")
 STATE_AI_MAX    = int(os.environ.get("STATE_AI_MAX")    or "10")
-# Per-tier feed caps so no single category monopolises feed slots.
-# Politics articles can easily fill the entire feed (AP/TG news is ~60%
-# political). Caps keep the feed balanced across categories while staying
-# small enough that feed.json downloads fast on mobile (75×3+8 ≈ 230 articles
-# ≈ 600 KB vs 450 articles ≈ 1.4 MB at the old 150 default).
-# 0 = no cap per tier (not recommended — politics will crowd everything out).
-POLITICS_MAX      = int(os.environ.get("POLITICS_MAX")      or "75")
-FARMING_MAX       = int(os.environ.get("FARMING_MAX")       or "75")
-SPORTS_MAX        = int(os.environ.get("SPORTS_MAX")        or "75")
 # Time-bucket size for feed ordering. Within each bucket articles are ordered
-# by tier (politics first), but newer buckets always beat older buckets so a
-# recent general article outranks an old politics article.
+# by tier (Tier 1 important before Tier 2 entertainment), but newer buckets
+# always beat older ones so a fresh health article outranks a stale politics one.
 FEED_BUCKET_HOURS = int(os.environ.get("FEED_BUCKET_HOURS") or "1")
-# Rolling window for feed.json. Only articles published in the last N hours
-# are included in the live feed. Older articles live in daily archives.
-FEED_WINDOW_HOURS = int(os.environ.get("FEED_WINDOW_HOURS") or "24")
 # Number of daily archive snapshots (feed_vYYYYMMDD.json) to keep on R2.
 # Oldest archives beyond this count are pruned each run.
 ARCHIVE_KEEP_DAYS = int(os.environ.get("ARCHIVE_KEEP_DAYS") or "5")
-# IST timezone and 6 AM boundary for daily archival.
+# IST timezone — used for midnight feed cutoff and daily archival.
 IST = timezone(timedelta(hours=5, minutes=30))
-ARCHIVE_HOUR_IST = 6
 # Minimum hours between push notifications. Set via NOTIFICATION_GAP_HOURS
 # GitHub Variable. Default 3 h → max 8 pushes/day even on a fast news day.
 NOTIFICATION_GAP_HOURS = int(os.environ.get("NOTIFICATION_GAP_HOURS") or "3")
@@ -2179,16 +2166,13 @@ def _is_telugu_feed_item(d: dict) -> bool:
 
 
 # ─── Feed category priority tiers ────────────────────────
-# Tier 0 (top):    Andhra/India politics + govt schemes.
-# Tier 1:          Farming, weather, jobs, village — core local life.
-# Tier 2:          Sports, general news.
-# Tier 3 (bottom): Cinema — shown last, capped at CINEMA_MAX.
-# Unknown categories fall into tier 2 (general).
+# Tier 1 (important, FCM-eligible): all news categories that matter to readers.
+# Tier 2 (entertainment / lifestyle): cinema, sports, health — no FCM push.
+# Unknown categories default to Tier 1 (safer to surface unknown than suppress).
 _FEED_TIER: dict[str, int] = {
-    "politics": 0, "schemes": 0,
-    "farming": 1, "weather": 1, "jobs": 1, "village": 1, "health": 1,
-    "sports": 2, "general": 2,
-    "cinema": 3,
+    "politics": 1, "schemes": 1,
+    "farming": 1, "weather": 1, "jobs": 1, "village": 1, "general": 1,
+    "health": 2, "sports": 2, "cinema": 2,
 }
 
 
@@ -2247,46 +2231,41 @@ def _build_feed_combined(store: list[dict]) -> tuple[list[dict], dict]:
 
     Algorithm:
       1. Filter to Telugu-readable articles only.
-      2. Sort each tier newest-first and apply per-tier caps so no single
-         category monopolises the feed.
-      3. If the capped total is below FEED_MIN, fill the gap from overflow
-         articles (uncapped, in tier priority order) so we always publish at
-         least FEED_MIN articles when enough content exists.
-      4. Hard-cap the final list at FEED_MAX.
+      2. Separate into Tier 1 (important) and Tier 2 (entertainment).
+         Cinema within Tier 2 is capped at CINEMA_MAX to prevent flooding.
+      3. If combined total is below FEED_MIN, pull overflow to pad up.
+      4. Hard-cap at FEED_MAX.
+      5. Sort by time-bucket + tier so within each 1-hour window Tier 1
+         articles appear before Tier 2, but a fresh Tier 2 beats a stale Tier 1.
     """
     telugu = [d for d in store if _is_telugu_feed_item(d)]
 
     def _recency(d: dict) -> str:
         return d.get("publishedAt") or d.get("createdAt") or ""
 
-    # Build uncapped tier lists (needed later for overflow fill).
-    tier0_all = sorted([d for d in telugu if d.get("category") in ("politics", "schemes")],
-                       key=_recency, reverse=True)
-    tier1_all = sorted([d for d in telugu if d.get("category") in ("farming", "weather", "jobs", "village")],
-                       key=_recency, reverse=True)
-    tier2_all = sorted([d for d in telugu if d.get("category") in ("sports", "general")],
-                       key=_recency, reverse=True)
-    cinema_all = sorted([d for d in telugu if d.get("category") == "cinema"],
-                        key=_recency, reverse=True)
+    tier1_all = sorted(
+        [d for d in telugu if _FEED_TIER.get(d.get("category") or "general", 1) == 1],
+        key=_recency, reverse=True,
+    )
+    cinema_all = sorted(
+        [d for d in telugu if d.get("category") == "cinema"],
+        key=_recency, reverse=True,
+    )
+    tier2_other_all = sorted(
+        [d for d in telugu if _FEED_TIER.get(d.get("category") or "general", 1) == 2
+         and d.get("category") != "cinema"],
+        key=_recency, reverse=True,
+    )
 
-    # Apply per-tier caps.
-    tier0  = tier0_all[:POLITICS_MAX]  if POLITICS_MAX > 0 else tier0_all
-    tier1  = tier1_all[:FARMING_MAX]   if FARMING_MAX  > 0 else tier1_all
-    tier2  = tier2_all[:SPORTS_MAX]    if SPORTS_MAX   > 0 else tier2_all
-    cinema = cinema_all[:CINEMA_MAX]   if CINEMA_MAX   > 0 else cinema_all
+    cinema = cinema_all[:CINEMA_MAX] if CINEMA_MAX > 0 else cinema_all
+    combined = tier1_all + tier2_other_all + cinema
 
-    combined = tier0 + tier1 + tier2 + cinema
-
-    # ── FEED_MIN fill ────────────────────────────────────────────────────
-    # If tier caps produced fewer articles than FEED_MIN (e.g. only politics
-    # articles exist in the store so farming/sports buckets are empty), pull
-    # overflow from the uncapped lists in tier-priority order to top up.
-    # This ensures the app always has at least FEED_MIN articles to show.
+    # ── FEED_MIN fill ─────────────────────────────────────────────────────
     target = min(FEED_MIN, FEED_MAX)
     if FEED_MIN > 0 and len(combined) < target:
         combined_ids = {d["id"] for d in combined}
         overflow = [
-            d for d in (tier0_all + tier1_all + tier2_all + cinema_all)
+            d for d in (tier1_all + tier2_other_all + cinema_all)
             if d["id"] not in combined_ids
         ]
         needed = target - len(combined)
@@ -2300,11 +2279,10 @@ def _build_feed_combined(store: list[dict]) -> tuple[list[dict], dict]:
     combined = combined[:FEED_MAX]
 
     # ── Time-bucket + tier sort ───────────────────────────────────────────
-    # Re-order the selected articles so that recency and tier both matter.
-    # Key = (bucket, tier, -timestamp):
-    #   bucket 0 = 0–FEED_BUCKET_HOURS hours ago (most recent window)
-    #   Within a bucket: tier 0 (politics) beats tier 2 (general)
-    #   Across buckets: a fresh general article beats a stale politics one
+    # Key = (bucket, tier, -timestamp).
+    # bucket 0 = most recent FEED_BUCKET_HOURS window.
+    # Within a bucket: Tier 1 (important) before Tier 2 (entertainment).
+    # Across buckets: fresh Tier 2 beats stale Tier 1.
     now_ts = datetime.now(timezone.utc).timestamp()
 
     def _bucket_key(d: dict) -> tuple:
@@ -2315,17 +2293,30 @@ def _build_feed_combined(store: list[dict]) -> tuple[list[dict], dict]:
             ts = 0.0
         hours_ago = max(0.0, (now_ts - ts) / 3600)
         bucket = int(hours_ago / FEED_BUCKET_HOURS)
-        tier   = _FEED_TIER.get(d.get("category") or "general", 2)
+        tier   = _FEED_TIER.get(d.get("category") or "general", 1)
         return (bucket, tier, -ts)
 
     combined.sort(key=_bucket_key)
 
     stats = {
-        "tier0": len(tier0), "tier1": len(tier1),
-        "tier2": len(tier2), "cinema": len(cinema),
+        "tier1": len(tier1_all),
+        "tier2_other": len(tier2_other_all),
+        "cinema": len(cinema),
         "skipped_non_te": len(store) - len(telugu),
     }
     return combined, stats
+
+
+def _midnight_ist_cutoff() -> datetime:
+    """Return today's midnight IST as a UTC-aware datetime.
+
+    The live feed shows articles published since midnight IST today. This gives
+    a predictable, date-aligned window: users always see today's news, not a
+    rolling 24-hour slice that shifts by the hour.
+    """
+    now_ist = datetime.now(timezone.utc).astimezone(IST)
+    midnight_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_ist.astimezone(timezone.utc)
 
 
 def _feed_article_ids(store: list[dict]) -> set:
@@ -2334,7 +2325,7 @@ def _feed_article_ids(store: list[dict]) -> set:
     Uses _build_feed_combined() so audio synthesis targets exactly the same
     articles that will be published. No R2 call.
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=FEED_WINDOW_HOURS)
+    cutoff = _midnight_ist_cutoff()
     recent = [d for d in store if _after_cutoff(d, cutoff)]
     combined, _ = _build_feed_combined(recent)
     return {d["id"] for d in combined if d.get("id")}
@@ -2344,57 +2335,49 @@ def export_feed_to_r2(store: list[dict]) -> None:
     """Publish the Telugu-only public feed.json to R2 from the in-memory
     working set (Decision 3 — NO Firestore reads).
 
-    Only Telugu-readable articles are published (see _is_telugu_feed_item).
-    Articles are ordered by audience priority then recency:
-      Tier 0 (top): politics + schemes   — newest first
-      Tier 1:       farming / weather / jobs / village — newest first
-      Tier 2:       sports + general     — newest first
-      Tier 3 (end): cinema, capped at CINEMA_MAX (default 8)
-
-    Algorithm: two-pass stable sort (Python sort is guaranteed stable):
-      Pass 1 — sort by recency desc (publishedAt, createdAt fallback)
-      Pass 2 — stable sort by tier asc  ← preserves recency within each tier
-    Cinema is split out before sorting, capped, then appended at the end.
+    Window: articles published since midnight IST today (date-aligned).
+    Ordering: time-bucket (1h) + tier — Tier 1 (important) before Tier 2
+    (entertainment) within each bucket; fresher buckets beat older ones.
+    Minimum FEED_MIN articles guaranteed (pads with older articles if needed).
     """
     import feed_r2
     if not feed_r2.r2_enabled():
         log.info("feed export skipped — R2 not configured")
         return
 
-    # Rolling 24h window: only recent articles enter the live feed.
-    # Older articles are preserved in articles.json for archive building.
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=FEED_WINDOW_HOURS)
+    # Midnight IST today: predictable date-aligned window.
+    cutoff = _midnight_ist_cutoff()
     recent = [d for d in store if _after_cutoff(d, cutoff)]
     combined, stats = _build_feed_combined(recent)
 
     log.info(
-        "feed: %d articles -> R2 (last %dh)  "
-        "[politics/schemes=%d(cap=%d)  farming/etc=%d(cap=%d)  "
-        "sports/general=%d(cap=%d)  cinema=%d(cap=%d)]  non-Telugu excluded=%d",
-        len(combined), FEED_WINDOW_HOURS,
-        stats["tier0"],  POLITICS_MAX,
-        stats["tier1"],  FARMING_MAX,
-        stats["tier2"],  SPORTS_MAX,
-        stats["cinema"], CINEMA_MAX,
+        "feed: %d articles -> R2 (since midnight IST)  "
+        "[tier1=%d  tier2_other=%d  cinema=%d(cap=%d)]  non-Telugu excluded=%d",
+        len(combined),
+        stats["tier1"], stats["tier2_other"], stats["cinema"], CINEMA_MAX,
         stats["skipped_non_te"],
     )
 
     out = [_format_article_for_feed(d) for d in combined]
-    log.info("feed: %d Telugu articles published, %d non-Telugu excluded",
-             len(out), stats["skipped_non_te"])
     feed_r2.upload_feed(out)
 
 
 def archive_daily_feed_if_needed(store: list[dict]) -> None:
-    """Create a daily archive snapshot (feed_vYYYYMMDD.json) once per day at 6 AM IST.
+    """Create a daily archive snapshot (feed_vYYYYMMDD.json) once per day.
 
-    Archive window: yesterday 6 AM IST → today 6 AM IST.
-    Archive name:   feed_v{YYYYMMDD}.json where YYYYMMDD = today (IST) = the END of the window.
-    Guard:          HEAD-check on R2 so multiple runs after 6 AM only archive once.
-    Prune:          Archives older than ARCHIVE_KEEP_DAYS are deleted from R2.
+    Archive window: yesterday midnight IST → today midnight IST (matches the live
+    feed window so the app can load yesterday's articles seamlessly when the user
+    swipes to the end of today's feed).
 
-    Called before export_feed_to_r2 so the archive captures the full previous day
-    before the live feed is refreshed.
+    Archive name: feed_v{YYYYMMDD}.json where YYYYMMDD = YESTERDAY's IST date
+    (the date the articles actually belong to). This keeps naming intuitive:
+    the app can request yesterday's archive by decrementing today's date by 1.
+
+    No per-category caps are applied — the archive stores every Telugu article
+    published that day so "load yesterday" shows the full picture.
+
+    Guard:   HEAD-check on R2 so multiple runs on the same day only archive once.
+    Prune:   Archives older than ARCHIVE_KEEP_DAYS are deleted from R2.
     """
     import feed_r2
     if not feed_r2.r2_enabled():
@@ -2403,28 +2386,29 @@ def archive_daily_feed_if_needed(store: list[dict]) -> None:
     now_utc = datetime.now(timezone.utc)
     now_ist = now_utc.astimezone(IST)
 
-    # Today's 6 AM IST boundary in UTC.
-    today_6am_ist = now_ist.replace(hour=ARCHIVE_HOUR_IST, minute=0, second=0, microsecond=0)
-    today_6am_utc = today_6am_ist.astimezone(timezone.utc)
+    # Midnight boundaries in UTC.
+    today_midnight_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_midnight_utc = today_midnight_ist.astimezone(timezone.utc)
+    yesterday_midnight_utc = today_midnight_utc - timedelta(days=1)
 
-    if now_utc < today_6am_utc:
-        # Before today's 6 AM IST — nothing to archive yet.
-        return
-
-    date_str = now_ist.strftime("%Y%m%d")
+    # Archive is named after yesterday (the date the articles belong to).
+    yesterday_ist = now_ist - timedelta(days=1)
+    date_str = yesterday_ist.strftime("%Y%m%d")
 
     if feed_r2.archive_exists(date_str):
         log.info("archive: feed_v%s.json already exists — skipping", date_str)
     else:
-        # Build archive: Telugu articles published in [yesterday 6AM IST, today 6AM IST).
-        yesterday_6am_utc = today_6am_utc - timedelta(days=1)
         def _in_window(d: dict) -> bool:
             dt = _pub_dt(d)
-            return dt is not None and yesterday_6am_utc <= dt < today_6am_utc
+            return dt is not None and yesterday_midnight_utc <= dt < today_midnight_utc
 
         windowed = [d for d in store if _is_telugu_feed_item(d) and _in_window(d)]
-        combined, _ = _build_feed_combined(windowed)
-        out = [_format_article_for_feed(d) for d in combined]
+        # Store ALL articles from yesterday — no caps.
+        out = sorted(
+            [_format_article_for_feed(d) for d in windowed],
+            key=lambda d: d.get("publishedAt") or "",
+            reverse=True,
+        )
         if out:
             url = feed_r2.upload_archive(out, date_str)
             if url:
@@ -2433,8 +2417,8 @@ def archive_daily_feed_if_needed(store: list[dict]) -> None:
             log.info("archive: feed_v%s.json — 0 Telugu articles in window, skipping upload", date_str)
 
     # Prune archives older than ARCHIVE_KEEP_DAYS.
-    for days_ago in range(ARCHIVE_KEEP_DAYS + 1, ARCHIVE_KEEP_DAYS + 8):
-        old_date = (now_ist - timedelta(days=days_ago)).strftime("%Y%m%d")
+    for days_ago in range(ARCHIVE_KEEP_DAYS, ARCHIVE_KEEP_DAYS + 8):
+        old_date = (yesterday_ist - timedelta(days=days_ago)).strftime("%Y%m%d")
         feed_r2.delete_archive(old_date)
 
 
@@ -3427,8 +3411,9 @@ def notify_new_articles(db: firestore.Client, store: list[dict],
         return
 
     # ── Pick the best article to feature in the notification ─────────────
-    # Tier 0/1 categories — matches _FEED_TIER in the feed exporter.
-    NOTIFY_TIERS = {"politics", "schemes", "farming", "weather", "jobs", "village"}
+    # Tier 1 categories — matches _FEED_TIER in the feed exporter.
+    # Tier 2 (cinema, sports, health) never triggers a push notification.
+    NOTIFY_TIERS = {"politics", "schemes", "farming", "weather", "jobs", "village", "general"}
     # Only consider newly-added ai=True Telugu articles in qualifying tiers.
     candidates = [
         a for a in new_articles
@@ -3437,7 +3422,7 @@ def notify_new_articles(db: firestore.Client, store: list[dict],
         and a.get("category", "general") in NOTIFY_TIERS
     ]
     if not candidates:
-        log.info("fcm: no Tier 0/1 Telugu articles in this run — skip notification")
+        log.info("fcm: no Tier 1 Telugu articles in this run — skip notification")
         return
 
     # Newest qualifying article is the lead.
