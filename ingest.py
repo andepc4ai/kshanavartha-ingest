@@ -924,6 +924,43 @@ SUMMARY_PROMPT = (
     "శీర్షిక: {headline}\nమూల వచనం: {summary}"
 )
 
+# Extended prompt — same as above but also asks for CATEGORY and LEVEL.
+# Used only when our own classifiers are uncertain (no URL signal + low
+# sklearn confidence). The AI hint is fed back as a soft signal into the
+# classification cascade; it never overrides a high-confidence local result.
+SUMMARY_PROMPT_WITH_CAT = (
+    SUMMARY_PROMPT.replace(
+        "TITLE:, BODY: ట్యాగ్లు ఇంగ్లీష్‌లోనే ఉంచండి.\n\n"
+        "శీర్షిక: {headline}\nమూల వచనం: {summary}",
+        "TITLE:, BODY:, CATEGORY:, LEVEL: ట్యాగ్లు ఇంగ్లీష్‌లోనే ఉంచండి.\n"
+        "CATEGORY: వార్త విషయాన్ని బట్టి ఒక్క వర్గం మాత్రమే: "
+        "politics | farming | weather | jobs | health | village | sports | cinema | schemes | general\n"
+        "LEVEL: భౌగోళిక స్థాయి ఒక్క పదంలో: "
+        "village | mandal | district | state | national\n\n"
+        "శీర్షిక: {headline}\nమూల వచనం: {summary}"
+    )
+)
+
+
+def _category_is_confident(url: str, headline: str, summary: str) -> bool:
+    """True when we already know the category with high confidence.
+
+    Two signals count as confident:
+    1. URL-based detection fired (publisher put the article under a category slug).
+    2. sklearn model returned confidence >= threshold on the raw text.
+
+    When either is true we skip CATEGORY/LEVEL from the AI prompt — no point
+    asking the model to spend tokens on something we already know.
+    """
+    if _cat_from_url(url):
+        return True
+    if _cat_model:
+        _, conf = _cat_model.predict(f"{headline} {summary or ''}")
+        if conf >= _CAT_THRESHOLD:
+            return True
+    return False
+
+
 # Valid category values the AI may return — must match CATEGORY_RULES keys + general.
 _AI_VALID_CATEGORIES = frozenset({
     "politics", "farming", "weather", "jobs", "village",
@@ -1033,7 +1070,7 @@ def _is_junk_content(text: str, image: str = "") -> bool:
     return hits >= 2  # require at least 2 signals to avoid false positives
 
 
-def gemini_summarize(pool: GeminiKeyPool, headline: str, raw_summary: str) -> str | None:
+def gemini_summarize(pool: GeminiKeyPool, headline: str, raw_summary: str, prompt: str = SUMMARY_PROMPT) -> str | None:
     """
     Try each key in the pool until one works or all are exhausted.
     Returns the polished Telugu summary, or None on per-article failure.
@@ -1041,7 +1078,7 @@ def gemini_summarize(pool: GeminiKeyPool, headline: str, raw_summary: str) -> st
     """
     body = {
         "contents": [{"role": "user", "parts": [{
-            "text": SUMMARY_PROMPT.format(headline=headline, summary=raw_summary),
+            "text": prompt.format(headline=headline, summary=raw_summary),
         }]}],
         "generationConfig": {"temperature": 0.3, "maxOutputTokens": 450, "topP": 0.8},
     }
@@ -1093,7 +1130,7 @@ def gemini_summarize(pool: GeminiKeyPool, headline: str, raw_summary: str) -> st
             return None
 
 
-def sambanova_summarize(headline: str, raw_summary: str) -> str | None:
+def sambanova_summarize(headline: str, raw_summary: str, prompt: str = SUMMARY_PROMPT) -> str | None:
     """
     Polish via SambaNova (Llama 3.3 70B), OpenAI-compatible chat completions.
     Used as the fallback of last resort when Cerebras and Gemini are exhausted.
@@ -1102,7 +1139,7 @@ def sambanova_summarize(headline: str, raw_summary: str) -> str | None:
     body = {
         "model": SAMBANOVA_MODEL,
         "messages": [
-            {"role": "user", "content": SUMMARY_PROMPT.format(headline=headline, summary=raw_summary)},
+            {"role": "user", "content": prompt.format(headline=headline, summary=raw_summary)},
         ],
         "temperature": 0.3,
         "max_tokens": 600,
@@ -1145,7 +1182,7 @@ def sambanova_summarize(headline: str, raw_summary: str) -> str | None:
             return None
 
 
-def cerebras_summarize(headline: str, raw_summary: str) -> str | None:
+def cerebras_summarize(headline: str, raw_summary: str, prompt: str = SUMMARY_PROMPT) -> str | None:
     """
     Polish via Cerebras (Llama 3.3 70B), OpenAI-compatible. Primary engine
     for production — generous free tier, strong Telugu. Multi-key rotation
@@ -1154,7 +1191,7 @@ def cerebras_summarize(headline: str, raw_summary: str) -> str | None:
     body = {
         "model": CEREBRAS_MODEL,
         "messages": [
-            {"role": "user", "content": SUMMARY_PROMPT.format(headline=headline, summary=raw_summary)},
+            {"role": "user", "content": prompt.format(headline=headline, summary=raw_summary)},
         ],
         "temperature": 0.3,
         # gpt-oss-120b is a thinking model: internal reasoning tokens count
@@ -1211,7 +1248,7 @@ def cerebras_summarize(headline: str, raw_summary: str) -> str | None:
         return text.strip().strip("\"'")
 
 
-def ollama_summarize(headline: str, raw_summary: str) -> str | None:
+def ollama_summarize(headline: str, raw_summary: str, prompt: str = SUMMARY_PROMPT) -> str | None:
     """
     Polish via a LOCAL Ollama model (zero API quota). Only used when
     OLLAMA_MODEL is set — for free unlimited local prompt iteration.
@@ -1220,7 +1257,7 @@ def ollama_summarize(headline: str, raw_summary: str) -> str | None:
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
-            {"role": "user", "content": SUMMARY_PROMPT.format(headline=headline, summary=raw_summary)},
+            {"role": "user", "content": prompt.format(headline=headline, summary=raw_summary)},
         ],
         "stream": False,
         "options": {"temperature": 0.3},
@@ -1247,6 +1284,7 @@ def polish_one(
     body: str,
     counters: dict[str, int],
     gemini_cap: int,
+    prompt: str = SUMMARY_PROMPT,
 ) -> tuple[str | None, str]:
     """
     Polish one article. Engine priority:
@@ -1257,13 +1295,13 @@ def polish_one(
     """
     # Local testing mode: route everything through the local model, no API.
     if OLLAMA_MODEL:
-        txt = ollama_summarize(headline, body)
+        txt = ollama_summarize(headline, body, prompt=prompt)
         counters["ollama_calls"] = counters.get("ollama_calls", 0) + 1
         return (txt, "ollama") if txt else (None, "none")
 
     # Production: Cerebras first (primary free-tier engine + strong Telugu).
     if CEREBRAS_API_KEY and cerebras_pool.has_capacity():
-        txt = cerebras_summarize(headline, body)
+        txt = cerebras_summarize(headline, body, prompt=prompt)
         counters["cerebras_calls"] = counters.get("cerebras_calls", 0) + 1
         time.sleep(CEREBRAS_CALL_DELAY_S)
         if txt:
@@ -1271,7 +1309,7 @@ def polish_one(
 
     if counters["gemini_calls"] < gemini_cap and pool.has_capacity():
         try:
-            txt = gemini_summarize(pool, headline, body)
+            txt = gemini_summarize(pool, headline, body, prompt=prompt)
             counters["gemini_calls"] += 1
             time.sleep(GEMINI_CALL_DELAY_S)
             if txt:
@@ -1281,7 +1319,7 @@ def polish_one(
 
     # SambaNova: fallback of last resort (Cerebras exhausted + Gemini quota gone).
     if SAMBANOVA_API_KEY and sambanova_pool.has_capacity():
-        txt = sambanova_summarize(headline, body)
+        txt = sambanova_summarize(headline, body, prompt=prompt)
         counters["sambanova_calls"] = counters.get("sambanova_calls", 0) + 1
         time.sleep(SAMBANOVA_CALL_DELAY_S)
         return (txt, "sambanova") if txt else (None, "none")
@@ -1959,8 +1997,14 @@ def main() -> int:
                     skip_level_cap = True
                     counters["skip_level_cap"] = counters.get("skip_level_cap", 0) + 1
             if not skip_english and not skip_te_rich and not skip_video and not skip_level_cap:
+                _prompt = (
+                    SUMMARY_PROMPT
+                    if _category_is_confident(a.link, a.headline, a.summary)
+                    else SUMMARY_PROMPT_WITH_CAT
+                )
                 polished, _engine = polish_one(
-                    pool, a.headline, a.summary, counters, MAX_TOTAL_GEMINI
+                    pool, a.headline, a.summary, counters, MAX_TOTAL_GEMINI,
+                    prompt=_prompt,
                 )
                 if polished and len(polished) > 20:
                     p_title, p_body, p_cat, p_level = _split_polished(polished)
