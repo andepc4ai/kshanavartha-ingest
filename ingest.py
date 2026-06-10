@@ -727,6 +727,15 @@ def detect_category(text: str) -> str:
     return "general"  # explicit fallback (was "village" — but most don't match village keywords either)
 
 
+# Whole-domain overrides — these sites publish only one category, so any
+# article from them is classified immediately without token scanning.
+_DOMAIN_CAT_OVERRIDES: dict[str, str] = {
+    "mirchi9.com":   "cinema",   # Telugu cinema/gossip portal
+    "123telugu.com": "cinema",   # Telugu film news portal
+    "indiaglitz.com":"cinema",   # South Indian entertainment portal
+    "filmibeat.com": "cinema",   # Pan-Indian film news
+}
+
 # URL path/domain → category hints.
 # Only strong, unambiguous segment-level matches are listed.
 # Partial English words (e.g. "government" contains "govern") are handled by
@@ -754,19 +763,23 @@ def _cat_from_url(url: str) -> str | None:
     """
     Return a category inferred from the article source URL, or None.
 
-    Checks domain tokens and path segments for unambiguous category keywords.
-    Only returns a result when confidence is high (full segment match), so
-    partial matches like /government/ (politics) don't fire on /governmental-aid/.
+    1. Whole-domain override (_DOMAIN_CAT_OVERRIDES) — instant match for
+       sites that publish only one category (e.g. mirchi9.com → cinema).
+    2. Token scan — checks domain parts and path segments against
+       _URL_CAT_PATTERNS. Full-token match only, so /government/ never
+       fires the "politics" rule via a partial substring.
     """
     if not url:
         return None
     try:
         from urllib.parse import urlparse
         parsed = urlparse(url.lower())
-        # Build a space-separated token list from subdomain+path segments
         domain = parsed.netloc.replace("www.", "")
+        # Step 1: whole-domain override
+        if domain in _DOMAIN_CAT_OVERRIDES:
+            return _DOMAIN_CAT_OVERRIDES[domain]
+        # Step 2: token scan on domain parts + path segments
         path = parsed.path
-        # Collect individual tokens: domain parts split on '.' and path parts split on '/''-'
         tokens: set[str] = set()
         tokens.update(domain.split("."))
         for seg in path.split("/"):
