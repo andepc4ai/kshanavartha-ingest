@@ -311,13 +311,25 @@ except ImportError:
     _LVL_THRESHOLD = 0.50
 
 
-def _classify_article(headline: str, summary: str, ai_cat: str | None = None) -> str:
-    """Three-tier category classification.
+def _classify_article(
+    headline: str,
+    summary: str,
+    ai_cat: str | None = None,
+    url: str | None = None,
+) -> str:
+    """Four-tier category classification.
 
-    1. sklearn model  — fast, local, no quota cost
-    2. AI p_cat       — used when model confidence is low
-    3. Keyword rules  — always-available fallback
+    0. URL path/domain — unambiguous segment-level keyword → instant return
+    1. sklearn model   — fast, local, no quota cost
+    2. AI p_cat        — used when model confidence is low
+    3. Keyword rules   — always-available fallback
     """
+    # Tier 0: URL-based hint (strongest signal — publisher explicitly placed
+    # the article under a category slug like /cinema/ or /sports/)
+    url_cat = _cat_from_url(url)
+    if url_cat:
+        return url_cat
+
     text = f"{headline} {summary or ''}"
     if _cat_model:
         cat, conf = _cat_model.predict(text)
@@ -713,6 +725,59 @@ def detect_category(text: str) -> str:
         if any(k.lower() in t for k in kws):
             return cat_id
     return "general"  # explicit fallback (was "village" — but most don't match village keywords either)
+
+
+# URL path/domain → category hints.
+# Only strong, unambiguous segment-level matches are listed.
+# Partial English words (e.g. "government" contains "govern") are handled by
+# requiring the keyword to appear as a full path segment or subdomain token.
+_URL_CAT_PATTERNS: list[tuple[str, list[str]]] = [
+    ("cinema",  ["cinema", "movie", "movies", "entertainment", "film", "films",
+                 "tollywood", "bollywood", "kollywood", "celeb", "celebrity",
+                 "box-office", "boxoffice", "trailer", "teaser"]),
+    ("health",  ["health", "lifestyle", "wellness", "fitness", "medical",
+                 "medicine", "diet", "nutrition"]),
+    ("sports",  ["sports", "sport", "cricket", "ipl", "football", "kabaddi",
+                 "olympics", "tennis", "hockey"]),
+    ("farming", ["farming", "agriculture", "agri", "krishi", "farmer",
+                 "horticulture", "aquaculture", "mandi"]),
+    ("weather", ["weather", "climate", "imd", "cyclone", "monsoon"]),
+    ("jobs",    ["jobs", "recruitment", "vacancy", "employment", "career",
+                 "sarkari-result", "sarkari-naukri"]),
+    ("politics",["politics", "political", "election", "elections", "parliament", "assembly"]),
+    ("schemes", ["scheme", "yojana", "welfare"]),
+    ("village", ["village", "gram", "panchayat", "rural"]),
+]
+
+
+def _cat_from_url(url: str) -> str | None:
+    """
+    Return a category inferred from the article source URL, or None.
+
+    Checks domain tokens and path segments for unambiguous category keywords.
+    Only returns a result when confidence is high (full segment match), so
+    partial matches like /government/ (politics) don't fire on /governmental-aid/.
+    """
+    if not url:
+        return None
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url.lower())
+        # Build a space-separated token list from subdomain+path segments
+        domain = parsed.netloc.replace("www.", "")
+        path = parsed.path
+        # Collect individual tokens: domain parts split on '.' and path parts split on '/''-'
+        tokens: set[str] = set()
+        tokens.update(domain.split("."))
+        for seg in path.split("/"):
+            tokens.update(seg.split("-"))
+        for cat, keywords in _URL_CAT_PATTERNS:
+            for kw in keywords:
+                if kw in tokens:
+                    return cat
+        return None
+    except Exception:
+        return None
 
 
 def detect_mandal(text: str) -> tuple[str, str | None]:
@@ -1723,7 +1788,7 @@ def parse_feed(feed: dict[str, str]) -> list[Article]:
             raw_summary = cleaned or headline
             body = cleaned or headline
         text = f"{headline} {raw_summary}"
-        category = _classify_article(headline, raw_summary or "")
+        category = _classify_article(headline, raw_summary or "", url=link)
         mandal, village = detect_mandal(text)
         if hasattr(entry, "published_parsed") and entry.published_parsed:
             published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
@@ -1926,7 +1991,7 @@ def main() -> int:
                     # Polished headline+summary is clean Telugu — ideal for
                     # both the sklearn model and the keyword fallback.
                     category = _classify_article(
-                        headline_out, summary_out, p_cat
+                        headline_out, summary_out, p_cat, url=a.link
                     )
                     summarized += 1
                     # Track which engine succeeded
