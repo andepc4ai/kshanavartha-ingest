@@ -2086,13 +2086,6 @@ def main() -> int:
     except Exception as e:
         log.warning("live_data update error: %s", e)
 
-    # ─── FCM push notifications ───────────────────────────
-    try:
-        sa_info = json.loads(os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "{}"))
-        notify_new_articles(db, store, new_articles_list, sa_info)
-    except Exception as e:
-        log.warning("fcm notify error: %s", e)
-
     # ─── Cleanup: drop articles older than RETENTION_DAYS ──
     store, deleted = prune_old_articles(store)
     log.info("cleanup done — pruned=%d articles + audio/images from R2 (older than %d days)", deleted, RETENTION_DAYS)
@@ -2117,6 +2110,17 @@ def main() -> int:
         export_feed_to_r2(store)
     except Exception as e:
         log.warning("feed export error: %s", e)
+
+    # ─── FCM push notifications (after R2 export so article is live) ─────
+    # Must run after export_feed_to_r2 so the notified article is already in
+    # feed.json when the user taps the notification. Sending before export
+    # caused tryOpen to fail (article not in allArticles yet) → fell back to
+    # opening article index 0 instead of the notified article.
+    try:
+        sa_info = json.loads(os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "{}"))
+        notify_new_articles(db, store, new_articles_list, sa_info)
+    except Exception as e:
+        log.warning("fcm notify error: %s", e)
 
     # ─── Structured run report (captured in email) ────────
     feed_published = len([d for d in store if _is_telugu_feed_item(d)])
