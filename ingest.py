@@ -119,7 +119,7 @@ FEED_MAX = int(os.environ.get("FEED_MAX") or "2000")   # public feed.json size c
 FEED_MIN = int(os.environ.get("FEED_MIN") or "50")     # minimum articles; if today < 50, pad with yesterday's overflow
 # Cinema is capped so it never floods the feed regardless of volume.
 # 0 = no cap. Other Tier 2 categories (health, sports) are uncapped by default.
-CINEMA_MAX = int(os.environ.get("CINEMA_MAX") or "30")
+CINEMA_MAX = int(os.environ.get("CINEMA_MAX") or "8")
 # Per-run AI quota caps by geographic level. Village/mandal/district articles
 # get full quota; state + national are capped so they don't crowd out local
 # stories when the AI engines are limited. 0 = no cap.
@@ -1967,6 +1967,9 @@ def main() -> int:
             # YouTube items: headline + description are already the publisher's
             # own copy; no value in AI-rewriting it. Saves quota.
             skip_video = a.video_id is not None
+            # Cinema articles are already well-written Telugu gossip/entertainment
+            # copy — AI polishing adds little value and wastes quota on Tier 2 content.
+            skip_cinema = (a.category == "cinema")
             # Level-based AI cap: local news (village/mandal/district) gets
             # unlimited quota; state/national are capped per run so they
             # don't crowd out the hyper-local stories that matter most.
@@ -1980,7 +1983,9 @@ def main() -> int:
                 if level_ai_counts["state"] >= STATE_AI_MAX:
                     skip_level_cap = True
                     counters["skip_level_cap"] = counters.get("skip_level_cap", 0) + 1
-            if not skip_english and not skip_te_rich and not skip_video and not skip_level_cap:
+            if skip_cinema:
+                counters["skip_cinema"] = counters.get("skip_cinema", 0) + 1
+            if not skip_english and not skip_te_rich and not skip_video and not skip_cinema and not skip_level_cap:
                 polished, _engine = polish_one(
                     pool, a.headline, a.summary, counters, MAX_TOTAL_GEMINI
                 )
@@ -3625,6 +3630,7 @@ def _print_run_report(
     skip_eng = counters.get("skip_english", 0)
     skip_te  = counters.get("skip_te_rich", 0)
     skip_vid = counters.get("skip_video", 0)
+    skip_cin = counters.get("skip_cinema", 0)
     skip_lvl = counters.get("skip_level_cap", 0)
     ai_fail  = counters.get("ai_fail", 0)
     print(f"\nAI PROCESSING  (of {new_count} new articles)")
@@ -3635,6 +3641,7 @@ def _print_run_report(
     print(f"  Native Telugu  : {skip_te}   (≥60 Te words — no AI needed, audio-eligible)")
     print(f"  English held   : {skip_eng}   (ENGLISH_POLISH not set)")
     print(f"  YouTube videos : {skip_vid}   (no AI for video items)")
+    print(f"  Cinema skipped : {skip_cin}   (Tier 2 — no AI polish)")
     print(f"  Level-capped   : {skip_lvl}   (national≤{NATIONAL_AI_MAX}, state≤{STATE_AI_MAX} per run)")
     print(f"  AI called, failed : {ai_fail}")
 
