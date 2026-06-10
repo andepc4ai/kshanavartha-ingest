@@ -192,6 +192,40 @@ def _recompress_mp3_file(path: str) -> None:
                 pass
 
 
+def _sanitize_for_tts(text: str) -> str:
+    """
+    Clean text before feeding to any TTS engine.
+
+    TTS engines (both gTTS and Google Cloud TTS) insert audible pauses for
+    punctuation that looks like a sentence boundary or a typographic separator.
+    The most common offenders in AI-generated Telugu summaries:
+
+      —  em-dash / en-dash  → replace with a comma (brief natural pause)
+      ;  semicolon          → replace with a comma
+      :  colon mid-sentence → replace with a comma
+      (…) parenthetical     → drop the parentheses, keep the content
+      \n newline            → replace with a space (paragraph break = long pause)
+      …  ellipsis           → replace with a period (explicit full stop)
+
+    Multiple spaces/commas are collapsed so the result is clean prose.
+    """
+    import re
+    # Newlines → space (paragraph break causes a very long silence in gTTS)
+    text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    # Em-dash, en-dash → comma (keep a brief natural beat)
+    text = text.replace("—", ",").replace("–", ",")
+    # Ellipsis character and triple-dot → period
+    text = text.replace("…", ".").replace("...", ".")
+    # Semicolons → comma
+    text = text.replace(";", ",")
+    # Remove parentheses but keep the content inside
+    text = re.sub(r"[()]", "", text)
+    # Collapse sequences of commas/spaces left by the above replacements
+    text = re.sub(r",\s*,+", ",", text)   # ,,  →  ,
+    text = re.sub(r"\s{2,}", " ", text)   # multiple spaces → single space
+    return text.strip()
+
+
 def synthesize_and_upload(article_id: str, text: str) -> str | None:
     """
     Narrate `text` (the Telugu summary) and upload as
@@ -203,7 +237,7 @@ def synthesize_and_upload(article_id: str, text: str) -> str | None:
 
     if not r2_enabled():
         return None
-    text = (text or "").strip()
+    text = _sanitize_for_tts((text or "").strip())
     if len(text) < 10:
         return None
 
