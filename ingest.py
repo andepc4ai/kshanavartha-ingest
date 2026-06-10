@@ -2219,6 +2219,7 @@ def _format_article_for_feed(d: dict) -> dict:
         "ai": bool(d.get("ai", False)),
         "publishedAt": d.get("publishedAt"),
         "videoId": d.get("videoId"),
+        "videoUrl": d.get("videoUrl"),
         "isShort": bool(d.get("isShort")),
         "featured": bool(d.get("featured")),
         "featuredUntil": d.get("featuredUntil"),
