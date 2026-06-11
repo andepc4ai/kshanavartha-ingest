@@ -251,6 +251,8 @@ FEEDS: list[dict[str, str]] = [
     # Probe-confirmed working Telugu sources (2026-05-18):
     {"url": "https://www.telugudesam.org/feed",                                         "source": "తెలుగుదేశం",          "lang": "te"},
     {"url": "https://tv9telugu.com/entertainment/feed",                                 "source": "TV9 సినిమా",          "lang": "te"},
+    {"url": "https://tv9telugu.com/devotional/feed",                                   "source": "TV9 ఆధ్యాత్మికం",     "lang": "te"},
+    {"url": "https://tv9telugu.com/astrology/feed",                                    "source": "TV9 జ్యోతిష్యం",      "lang": "te"},
     {"url": "https://www.mirchi9.com/feed",                                             "source": "మిర్చి9 సినిమా",      "lang": "te"},
     {"url": "https://www.123telugu.com/feed",                                           "source": "123తెలుగు సినిమా",    "lang": "te"},
     # Google News Telugu — very reliable aggregator (covers Eenadu, Andhra
@@ -361,6 +363,8 @@ SOURCE_LEVELS: dict[str, str] = {
     "TV9 తెలుగు":             "state",
     "తెలుగుదేశం":             "state",
     "TV9 సినిమా":             "national",
+    "TV9 ఆధ్యాత్మికం":        "national",
+    "TV9 జ్యోతిష్యం":         "national",
     "మిర్చి9 సినిమా":         "national",
     "123తెలుగు సినిమా":       "national",
     "గూగుల్ వార్తలు":         "state",
@@ -532,6 +536,24 @@ CATEGORY_RULES: list[tuple[str, list[str]]] = [
         "director", "song release", "pre-release", "audio launch",
         "blockbuster", "web series",
     ]),
+    # ── spiritual: BEFORE politics ───────────────────────────────────────
+    # Temple/devotional/astrology stories often mention politicians visiting
+    # or making donations — must be caught before the politics rule fires.
+    ("spiritual", [
+        # Telugu — temples & worship
+        "దేవాలయం", "గుడి", "మందిరం", "మఠం", "ఆశ్రమం", "పీఠం",
+        "పూజ", "అర్చన", "ప్రార్థన", "హారతి", "అభిషేకం",
+        "బ్రహ్మోత్సవాలు", "జాతర", "తీర్థయాత్ర", "పుణ్యక్షేత్రం", "క్షేత్రం",
+        # Telugu — spiritual figures & concepts
+        "స్వామి", "బాబా", "గురువు", "ఆధ్యాత్మిక", "భక్తి", "ధర్మం",
+        "అమ్మవారు", "దేవుడు", "శ్రీవారు", "వేంకటేశ్వర",
+        # Telugu — astrology
+        "జ్యోతిష్యం", "రాశిఫలాలు", "పంచాంగం", "గ్రహస్థితి", "రాశి",
+        # English
+        "spiritual", "devotional", "temple", "astrology", "horoscope",
+        "pilgrimage", "bhakti", "dharma", "swami", "mandir", "ashram",
+        "panchangam", "tirupati", "tirumala",
+    ]),
     # ── politics: strong signals only ───────────────────────────────────
     # REMOVED: "ప్రభుత్వం" (govt — appears in every news story, too broad)
     # REMOVED: "minister" (English generic — fires on any minister visit/event)
@@ -564,7 +586,7 @@ CATEGORY_RULES: list[tuple[str, list[str]]] = [
 COLOR_BY_CAT = {
     "village": "#EA580C", "farming": "#15803D", "schemes": "#0F172A",
     "weather": "#38BDF8", "jobs": "#B45309", "politics": "#7C2D12", "sports": "#15803D",
-    "cinema": "#9333EA",
+    "cinema": "#9333EA", "spiritual": "#D97706",
     "general": "#7C2D12",  # generic news — same colour as politics for now
 }
 
@@ -755,7 +777,10 @@ _URL_CAT_PATTERNS: list[tuple[str, list[str]]] = [
                  "sarkari-result", "sarkari-naukri"]),
     ("politics",["politics", "political", "election", "elections", "parliament", "assembly"]),
     ("schemes", ["scheme", "yojana", "welfare"]),
-    ("village", ["village", "gram", "panchayat", "rural"]),
+    ("village",   ["village", "gram", "panchayat", "rural"]),
+    ("spiritual", ["spiritual", "devotional", "astrology", "bhakti", "dharma",
+                   "astro", "temple", "religion", "horoscope", "panchangam",
+                   "tirumala", "tirupati"]),
 ]
 
 
@@ -934,7 +959,7 @@ SUMMARY_PROMPT_WITH_CAT = (
         "శీర్షిక: {headline}\nమూల వచనం: {summary}",
         "TITLE:, BODY:, CATEGORY:, LEVEL: ట్యాగ్లు ఇంగ్లీష్‌లోనే ఉంచండి.\n"
         "CATEGORY: వార్త విషయాన్ని బట్టి ఒక్క వర్గం మాత్రమే: "
-        "politics | farming | weather | jobs | health | village | sports | cinema | schemes | general\n"
+        "politics | farming | weather | jobs | health | village | sports | cinema | schemes | spiritual | general\n"
         "LEVEL: భౌగోళిక స్థాయి ఒక్క పదంలో: "
         "village | mandal | district | state | national\n\n"
         "శీర్షిక: {headline}\nమూల వచనం: {summary}"
@@ -964,7 +989,7 @@ def _category_is_confident(url: str, headline: str, summary: str) -> bool:
 # Valid category values the AI may return — must match CATEGORY_RULES keys + general.
 _AI_VALID_CATEGORIES = frozenset({
     "politics", "farming", "weather", "jobs", "village",
-    "health", "sports", "cinema", "schemes", "general",
+    "health", "sports", "cinema", "schemes", "spiritual", "general",
 })
 
 
@@ -2276,7 +2301,7 @@ def _is_telugu_feed_item(d: dict) -> bool:
 _FEED_TIER: dict[str, int] = {
     "politics": 1, "schemes": 1,
     "farming": 1, "weather": 1, "jobs": 1, "village": 1, "general": 1,
-    "health": 2, "sports": 2, "cinema": 2,
+    "health": 2, "sports": 2, "cinema": 2, "spiritual": 2,
 }
 
 
