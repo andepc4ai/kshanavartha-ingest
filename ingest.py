@@ -2192,14 +2192,16 @@ def main() -> int:
 
     # ─── Audio: narrate Telugu summaries → R2 (capped per run) ─
     audio_stats: dict = {"voiced": 0, "failed": 0, "skipped": 0, "candidates": 0}
-    feed_visible_ids: set = set()
+    # Compute feed_visible_ids in its own try/except — audio synthesis errors
+    # must not corrupt this set (FCM also uses it to guard candidate selection).
+    feed_visible_ids: set | None = None
     try:
-        # Compute the set of article IDs that will appear in feed.json so
-        # audio synthesis focuses only on feed-visible content. Articles
-        # excluded from the feed (old, over-cap, non-Telugu) are skipped.
         feed_visible_ids = _feed_article_ids(store)
         log.info("audio: %d feed-visible article(s) eligible for narration", len(feed_visible_ids))
-        audio_stats = synthesize_pending_audio(store, AUDIO_MAX_PER_RUN, feed_ids=feed_visible_ids)
+    except Exception as e:
+        log.warning("audio: feed_ids computation error — %s (FCM will send without feed filter)", e)
+    try:
+        audio_stats = synthesize_pending_audio(store, AUDIO_MAX_PER_RUN, feed_ids=feed_visible_ids or set())
         if audio_stats["voiced"]:
             log.info("audio done — narrated=%d article(s) → R2", audio_stats["voiced"])
     except Exception as e:
@@ -2249,11 +2251,12 @@ def main() -> int:
 
     # ─── Structured run report (captured in email) ────────
     feed_published = len([d for d in store if _is_telugu_feed_item(d)])
+    _fv = feed_visible_ids or set()
     audio_pending = sum(
         1 for d in store
         if not d.get("audioUrl")
         and d.get("ai") is True
-        and d.get("id") in feed_visible_ids
+        and d.get("id") in _fv
         and not d.get("videoId")
         and not _looks_english((d.get("summary") or "").strip())
         and len((d.get("summary") or "").strip()) >= 10
@@ -2264,7 +2267,7 @@ def main() -> int:
         gnews_enriched=gnews_enriched, blocked_count=len(blocked_ids),
         counters=counters, summarized=summarized,
         audio_stats=audio_stats, audio_pending=audio_pending,
-        feed_visible=len(feed_visible_ids),
+        feed_visible=len(_fv),
         store_total=len(store), feed_published=feed_published,
         pruned=deleted, retention_days=RETENTION_DAYS,
         gemini_pool=pool, cerebras_pool=cerebras_pool,
