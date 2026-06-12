@@ -2243,7 +2243,7 @@ def main() -> int:
     # opening article index 0 instead of the notified article.
     try:
         sa_info = json.loads(os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "{}"))
-        notify_new_articles(db, store, new_articles_list, sa_info)
+        notify_new_articles(db, store, new_articles_list, sa_info, feed_visible_ids)
     except Exception as e:
         log.warning("fcm notify error: %s", e)
 
@@ -2940,6 +2940,12 @@ def _update_training_data(store: list[dict]) -> None:
     existing = {k: v for k, v in existing.items() if (v.get("date") or "9999") >= cutoff_str}
     pruned = before_prune - len(existing)
 
+    # Skip R2 PUT when nothing changed — runs every 30 min so this saves
+    # ~90 unnecessary PUTs/day when there are no new verified articles.
+    if added == 0 and updated == 0 and pruned == 0:
+        log.info("training data: no changes — skipping R2 upload (total=%d)", len(existing))
+        return
+
     # Upload back
     payload = "\n".join(
         json.dumps(e, ensure_ascii=False) for e in existing.values()
@@ -3469,7 +3475,7 @@ def _fcm_send(project_id: str, sa_info: dict, title: str, body: str,
         log.warning("fcm send error: %s", e)
         return False
         
-def _fcm_send_to_token(project_id: str, sa_info: dict, title: str, body: str,
+def _fcm_send_to_token(project_id: str, access_token: str, title: str, body: str,
                        token: str, data: dict | None = None) -> tuple[bool, bool]:
     """Send FCM notification directly to a specific device token.
 
@@ -3477,8 +3483,10 @@ def _fcm_send_to_token(project_id: str, sa_info: dict, title: str, body: str,
     reports the token is no longer valid (UNREGISTERED) so the caller can
     delete it from Firestore. Triggered by HTTP 404 or 400-UNREGISTERED —
     the two canonical "this device reinstalled / token rotated" signals.
+
+    Accepts a pre-fetched access_token so the caller can reuse one OAuth
+    token across all device sends instead of making N HTTP round-trips.
     """
-    access_token = _fcm_access_token(sa_info)
     if not access_token:
         return False, False
     payload = {
@@ -3517,14 +3525,15 @@ def _fcm_send_to_token(project_id: str, sa_info: dict, title: str, body: str,
         return False, False
 
 def notify_new_articles(db: firestore.Client, store: list[dict],
-                        new_articles: list[dict], sa_info: dict) -> None:
-    """Send ONE push notification per run, Tier 0/1 articles only, with a
+                        new_articles: list[dict], sa_info: dict,
+                        feed_visible_ids: set | None = None) -> None:
+    """Send ONE push notification per run, Tier 1 articles only, with a
     NOTIFICATION_GAP_HOURS cooldown enforced via Firestore.
 
     Design (confirmed 2026-05):
     - One notification per run — avoids notification fatigue, free-tier safe.
-    - Only Tier 0 (politics, schemes) + Tier 1 (farming, weather, jobs, village, health)
-      qualify. Cinema/sports/general are not urgent enough.
+    - Only Tier 1 (politics, schemes, farming, weather, jobs, village, general)
+      qualify. Cinema/sports/health are not urgent enough.
     - 3-hour gap (tunable via NOTIFICATION_GAP_HOURS) prevents spam even when
       many articles land at once.
     - Notification title = article headline (≤65 chars). Body is empty so the
@@ -3532,6 +3541,8 @@ def notify_new_articles(db: firestore.Client, store: list[dict],
     - data payload: type="article", articleId=<id> — the app's existing
       pushNotificationActionPerformed handler opens SwipeReader at that article.
     - Dead tokens are pruned on the spot (FCM v1 UNREGISTERED signal).
+    - Candidates must be in feed_visible_ids so tryOpen() in the app always
+      finds the article (prevents fallback to article index 0).
 
     Only fires if FCM_ENABLED=1 env var is set.
     """
@@ -3544,12 +3555,16 @@ def notify_new_articles(db: firestore.Client, store: list[dict],
     # Tier 1 categories — matches _FEED_TIER in the feed exporter.
     # Tier 2 (cinema, sports, health) never triggers a push notification.
     NOTIFY_TIERS = {"politics", "schemes", "farming", "weather", "jobs", "village", "general"}
-    # Only consider newly-added ai=True Telugu articles in qualifying tiers.
+    # Only consider newly-added ai=True articles with Telugu summary in
+    # qualifying tiers that are actually visible in the published feed.
+    # lang=="te" was wrong — it checks RSS source language, not polished output.
+    # feed_visible_ids guard prevents notifying about articles the app can't open.
     candidates = [
         a for a in new_articles
         if a.get("ai") is True
-        and a.get("lang") == "te"
+        and not _looks_english(a.get("summary", ""))
         and a.get("category", "general") in NOTIFY_TIERS
+        and (feed_visible_ids is None or a.get("id") in feed_visible_ids)
     ]
     if not candidates:
         log.info("fcm: no Tier 1 Telugu articles in this run — skip notification")
@@ -3596,6 +3611,14 @@ def notify_new_articles(db: firestore.Client, store: list[dict],
         log.info("fcm: no tokens registered, skipping")
         return
 
+    # ── Get OAuth token ONCE — reused for all device sends ───────────────
+    # _fcm_send_to_token used to call _fcm_access_token() on every iteration,
+    # making N separate OAuth HTTP requests for N devices. Get it once here.
+    access_token = _fcm_access_token(sa_info)
+    if not access_token:
+        log.warning("fcm: could not obtain OAuth access token — skipping notification")
+        return
+
     # ── Send to every token ───────────────────────────────────────────────
     title = headline[:65]
     sent = 0
@@ -3605,7 +3628,7 @@ def notify_new_articles(db: firestore.Client, store: list[dict],
         if not token:
             continue
         ok, is_dead = _fcm_send_to_token(
-            project_id, sa_info, title, "",   # body="" so headline takes full width
+            project_id, access_token, title, "",   # body="" so headline takes full width
             token,
             data={"type": "article", "articleId": article_id},
         )
