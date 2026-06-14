@@ -1473,6 +1473,56 @@ def _smart_truncate(text: str, max_chars: int) -> str:
     return window
 
 
+_SENT_SPLIT_RE = re.compile(r'(?<=[.।!?])\s+')
+
+def _split_sentences(text: str) -> list[str]:
+    parts = _SENT_SPLIT_RE.split(text.strip())
+    return [p.strip() for p in parts if p.strip() and len(p.strip()) > 12]
+
+
+def _extractive_summary(text: str, max_chars: int = 280) -> str:
+    """Pick the 2 most representative sentences from raw RSS body text.
+
+    Scores by character-trigram overlap with the whole document (sentences
+    sharing the most n-grams with the full text are most informative) plus
+    a position bonus (news inverted pyramid: lead sentence = gold).
+    Sentences are returned in their original order.
+
+    Applied to non-AI, non-rich-Telugu, non-video articles so the feed
+    never shows messy raw RSS text longer than 2 clean sentences.
+    """
+    if not text or len(text) <= max_chars:
+        return text
+    sentences = _split_sentences(text)
+    if len(sentences) <= 2:
+        return _smart_truncate(text, max_chars)
+
+    flat_doc = text.replace(' ', '')
+    doc_freq: dict[str, int] = {}
+    for i in range(len(flat_doc) - 2):
+        k = flat_doc[i:i + 3]
+        doc_freq[k] = doc_freq.get(k, 0) + 1
+
+    scored: list[tuple[float, int, str]] = []
+    for pos, sent in enumerate(sentences):
+        flat_s = sent.replace(' ', '')
+        seen: set[str] = set()
+        overlap = 0
+        for i in range(len(flat_s) - 2):
+            k = flat_s[i:i + 3]
+            if k not in seen:
+                overlap += doc_freq.get(k, 0)
+                seen.add(k)
+        norm = overlap / max(len(sent), 1)
+        position_boost = 1.0 / (pos + 1) * 0.3
+        scored.append((norm + position_boost, pos, sent))
+
+    top2 = sorted(scored, key=lambda x: -x[0])[:2]
+    in_order = [t[2] for t in sorted(top2, key=lambda x: x[1])]
+    result = ' '.join(in_order)
+    return _smart_truncate(result, max_chars) if len(result) > max_chars else result
+
+
 # Markers that signal the start of YouTube channel boilerplate in a video
 # description (Subscribe, social links, hashtags, URLs). We cut the body
 # at the FIRST marker found — everything before is real lead content,
@@ -1807,7 +1857,7 @@ def parse_feed(feed: dict[str, str]) -> list[Article]:
         # Smart-truncate the lead so summaries always end at a sentence
         # boundary — was a hard body[:800] before, which routinely cut
         # mid-sentence and produced ugly dangling text. (User feedback.)
-        raw_summary = _smart_truncate(body, 800)
+        raw_summary = _smart_truncate(body, 600)
         image = _httpsify(_best_image_url(entry))
         link = getattr(entry, "link", "") or ""
         # YouTube detection — if the entry link is a YouTube video URL,
@@ -2077,6 +2127,15 @@ def main() -> int:
             if skip_te_rich:
                 headline_out = _sanitize_summary(headline_out)
                 summary_out = _sanitize_summary(summary_out)
+
+            # For articles where AI didn't run (skipped or failed) and the
+            # content is not already rich Telugu or a video embed: extract the
+            # 2 most representative sentences so the feed never shows long,
+            # messy raw RSS text. skip_te_rich is already publication-quality;
+            # skip_video uses the channel description as-is.
+            if polished is None and not skip_te_rich and not skip_video:
+                summary_out = _extractive_summary(summary_out)
+                counters["extractive"] = counters.get("extractive", 0) + 1
 
             if DRY_RUN:
                 # No Firestore — collect for the local CSV instead.
