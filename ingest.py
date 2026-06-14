@@ -2773,10 +2773,11 @@ def synthesize_pending_audio(store: list[dict], limit: int,
             break
         if d.get("audioUrl"):
             continue
-        # YouTube video items don't get gTTS narration — the user watches
-        # the video itself. The article's image is the video thumbnail
-        # and the client renders a tap-to-embed iframe.
-        if d.get("videoId"):
+        # Video articles (YouTube embeds or WhatsApp R2 clips) don't get
+        # gTTS narration — the user watches the video. Generating a separate
+        # audio track wastes gTTS quota and creates a confusing audio player
+        # alongside the inline video player.
+        if d.get("videoId") or d.get("videoUrl"):
             skipped += 1
             continue
         # Only generate audio for articles currently visible in feed.json.
