@@ -1375,8 +1375,11 @@ def init_firestore() -> firestore.Client:
 #   https://www.youtube.com/watch?v=VIDEO_ID
 #   https://youtu.be/VIDEO_ID
 #   https://www.youtube.com/embed/VIDEO_ID
+#   https://www.youtube.com/shorts/VIDEO_ID  ← Shorts; caught here so the
+#       _is_youtube_short() check can drop them (were slipping through as
+#       broken image-only articles when the Shorts URL was the article link)
 # Video IDs are always exactly 11 chars from the [A-Za-z0-9_-] set.
-_YOUTUBE_VIDEO_RE = re.compile(r'(?:youtube\.com/(?:watch\?v=|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})')
+_YOUTUBE_VIDEO_RE = re.compile(r'(?:youtube\.com/(?:watch\?v=|embed/|shorts/)|youtu\.be/)([A-Za-z0-9_-]{11})')
 
 def _extract_youtube_id(url: str) -> str | None:
     """Extract the 11-char YouTube video ID from any standard YouTube URL,
