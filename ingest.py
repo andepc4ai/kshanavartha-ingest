@@ -1754,28 +1754,83 @@ def _gn_session():
     return _GN_SESSION
 
 
+def _decode_gnews_b64(url: str) -> str | None:
+    """
+    Offline decode of a news.google.com RSS article URL to the real publisher URL.
+
+    Google encodes the publisher URL inside the base64url article ID using a
+    lightweight protobuf wrapper.  This avoids the batchexecute HTTP round-trip
+    entirely and works even when Google removes the data-n-a-sg/ts attributes
+    from their redirect page.
+
+    Returns the decoded publisher URL or None.
+    """
+    try:
+        import base64 as _b64
+        m = re.search(r"/articles/([^?&]+)", url or "")
+        if not m:
+            return None
+        article_id = m.group(1)
+        padding = (4 - len(article_id) % 4) % 4
+        decoded = _b64.urlsafe_b64decode(article_id + "=" * padding)
+        # The protobuf bytes embed the publisher URL as UTF-8 text.
+        # Layout (typical): \x08\x13"<varint-len><url-bytes>[optional extra fields]
+        # Fast path: scan for the first http(s) URL that is NOT back on Google.
+        text = decoded.decode("utf-8", errors="replace")
+        for m2 in re.finditer(r"https?://\S+", text):
+            candidate = m2.group(0)
+            # Strip trailing HTML-context punctuation that may have been appended
+            while candidate and candidate[-1] in '.,;:\'")>':
+                candidate = candidate[:-1]
+            if candidate and "news.google.com" not in candidate:
+                return candidate
+        return None
+    except Exception as exc:
+        log.debug("gnews b64 decode failed: %s", exc)
+        return None
+
+
 def _resolve_gnews_url(url: str) -> str | None:
-    """Decode a news.google.com/rss/articles/… link to the real URL."""
+    """Decode a news.google.com/rss/articles/\u2026 link to the real URL.
+
+    Tries offline base64 decode first (fast, no HTTP), then falls back to the
+    batchexecute API (requires data-n-a-sg/ts on the redirect page -- Google
+    has been removing these, so this path often fails silently now).
+    """
+    # ---- Method 1: offline protobuf / base64 decode (preferred) -----------
+    real = _decode_gnews_b64(url)
+    if real:
+        log.debug("gnews b64 ok: %s", real[:80])
+        return real
+    # ---- Method 2: batchexecute API (legacy fallback) ---------------------
     m = re.search(r"/articles/([^?]+)", url or "")
     if not m:
         return None
     art = m.group(1)
-    s = _gn_session()
-    p = s.get(url, timeout=12)
-    sg = re.search(r'data-n-a-sg="([^"]+)"', p.text)
-    ts = re.search(r'data-n-a-ts="([^"]+)"', p.text)
-    if not (sg and ts):
+    try:
+        s = _gn_session()
+        p = s.get(url, timeout=12)
+        sg = re.search(r'data-n-a-sg="([^"]+)"', p.text)
+        ts = re.search(r'data-n-a-ts="([^"]+)"', p.text)
+        if not (sg and ts):
+            log.debug("gnews batchexecute: no sg/ts on redirect page (http=%s)", p.status_code)
+            return None
+        req = ('["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",'
+               'null,1,null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,'
+               'null,0,0,null,0],"' + art + '",' + ts.group(1) + ',"'
+               + sg.group(1) + '"]')
+        r = s.post("https://news.google.com/_/DotsSplashUi/data/batchexecute",
+                   data={"f.req": json.dumps([[["Fbv4je", req]]])}, timeout=12)
+        if "garturlres" not in r.text:
+            log.debug("gnews batchexecute: garturlres not in response")
+            return None
+        u = re.search(r'(https?://[^\\"]+)', r.text.split("garturlres")[1])
+        if u:
+            log.debug("gnews batchexecute ok: %s", u.group(1)[:80])
+        return u.group(1) if u else None
+    except Exception as exc:
+        log.debug("gnews batchexecute failed: %s", exc)
         return None
-    req = ('["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",'
-           'null,1,null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,'
-           'null,0,0,null,0],"' + art + '",' + ts.group(1) + ',"'
-           + sg.group(1) + '"]')
-    r = s.post("https://news.google.com/_/DotsSplashUi/data/batchexecute",
-               data={"f.req": json.dumps([[["Fbv4je", req]]])}, timeout=12)
-    if "garturlres" not in r.text:
-        return None
-    u = re.search(r'(https?://[^\\"]+)', r.text.split("garturlres")[1])
-    return u.group(1) if u else None
 
 
 def _scrape_og(html_text: str) -> tuple[str | None, str | None]:
