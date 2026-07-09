@@ -100,7 +100,7 @@ def load_articles() -> list[dict]:
         return []
 
 
-def save_articles(articles: list[dict]) -> bool:
+def save_articles(articles: list[dict], known_removed_ids: set | None = None) -> bool:
     """
     Persist the full working set with merge-on-drift protection.
 
@@ -115,7 +115,16 @@ def save_articles(articles: list[dict]) -> bool:
       • Articles in OUR store    → use our version (preserves audioUrl
                                    updates, AI polish, etc.)
       • Articles in R2 but NOT   → preserve as-is (added by the concurrent
-        in our store               run while we were processing)
+        in our store, and NOT      run while we were processing)
+        in known_removed_ids
+
+    known_removed_ids: IDs this run deliberately dropped (blocklist purge,
+    Shorts/junk cleanup, retention prune). Without this, the merge step
+    can't tell "removed on purpose" from "missing because of a concurrent
+    write" — it would resurrect every intentional deletion on every run.
+    (This is exactly what silently defeated RETENTION_DAYS from 2026-05-29
+    until it was diagnosed and fixed on 2026-07-09 — the store grew to
+    25k+ articles because prune_old_articles() never actually stuck.)
 
     If R2 has >50 more articles than us, that means our load was stale
     (not just a small concurrent race) — we log a WARNING so the operator
@@ -130,6 +139,7 @@ def save_articles(articles: list[dict]) -> bool:
         return False
 
     local = _local_path()   # resolved once; used by merge block + write block
+    removed = known_removed_ids or set()
 
     # ── Merge-on-drift safeguard (R2 mode only) ───────────────────────────
     if not local and _r2_enabled():
@@ -138,8 +148,10 @@ def save_articles(articles: list[dict]) -> bool:
             r2_count   = len(r2_current)
             our_count  = len(articles)
             our_ids    = {a["id"] for a in articles}
-            # Articles added to R2 while we were running (concurrent write)
-            r2_only    = [a for a in r2_current if a["id"] not in our_ids]
+            # Articles added to R2 while we were running (concurrent write) —
+            # excludes anything we deliberately removed this run.
+            r2_only    = [a for a in r2_current
+                          if a["id"] not in our_ids and a["id"] not in removed]
             if r2_only:
                 articles = articles + r2_only   # our updates win; R2-only preserved
                 if r2_count > our_count + 50:

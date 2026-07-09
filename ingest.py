@@ -2027,6 +2027,11 @@ def main() -> int:
     # community_reports, live_data (weather/mandi) — all tiny.
     store: list[dict] = []
     seen_ids: set[str] = set()
+    # Track every ID we deliberately drop this run (blocklist purge,
+    # Shorts/junk cleanup, retention prune) so save_articles()'s
+    # merge-on-drift guard doesn't resurrect them from R2 — see
+    # article_store.save_articles() docstring.
+    removed_ids: set[str] = set()
     blocked_ids = load_blocklist()
     if DRY_RUN:
         db = None
@@ -2037,16 +2042,21 @@ def main() -> int:
         # Purge any blocked articles already in the working set so they're
         # removed from articles.json on this run's save.
         if blocked_ids:
-            before = len(store)
+            before_ids = {a.get("id") for a in store}
             store = [a for a in store if a.get("id") not in blocked_ids]
-            purged = before - len(store)
+            after_ids = {a.get("id") for a in store}
+            purged = len(before_ids) - len(after_ids)
+            removed_ids |= before_ids - after_ids
             if purged:
                 log.info("blocklist purged %d article(s) from store", purged)
         # Backfill cleanup pass — sanitizes ALL article summaries (strip
         # junk chars like ►/🔥), drops Shorts and LIVE-stream videos that
         # slipped past earlier filters. Cheap on a clean store; the
         # video-side HEAD checks only fire for unclassified items.
+        before_ids = {a.get("id") for a in store}
         cleanup_existing_articles(store)
+        after_ids = {a.get("id") for a in store}
+        removed_ids |= before_ids - after_ids
         seen_ids = {a.get("id") for a in store if a.get("id")}
         # Add blocked IDs to seen_ids so they are never re-fetched from RSS.
         seen_ids.update(blocked_ids)
@@ -2331,7 +2341,10 @@ def main() -> int:
         log.warning("live_data update error: %s", e)
 
     # ─── Cleanup: drop articles older than RETENTION_DAYS ──
+    before_ids = {a.get("id") for a in store}
     store, deleted = prune_old_articles(store)
+    after_ids = {a.get("id") for a in store}
+    removed_ids |= before_ids - after_ids
     log.info("cleanup done — pruned=%d articles + audio/images from R2 (older than %d days)", deleted, RETENTION_DAYS)
 
     # ─── Persist working set + publish public feed → R2 ─────
@@ -2339,7 +2352,7 @@ def main() -> int:
     # Save the full working set, then publish the Telugu-only public view.
     # Zero Firestore reads here → the free quota can never throttle the cron.
     try:
-        article_store.save_articles(store)
+        article_store.save_articles(store, known_removed_ids=removed_ids)
     except Exception as e:
         log.warning("article store save error: %s", e)
     try:
