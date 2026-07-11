@@ -1007,7 +1007,7 @@ def _split_polished(raw: str) -> tuple[str | None, str, str | None, str | None]:
     headline and category are None.
     """
     if not raw:
-        return None, "", None
+        return None, "", None, None
     title = None
     body_parts: list[str] = []
     ai_category: str | None = None
@@ -1042,7 +1042,7 @@ def _split_polished(raw: str) -> tuple[str | None, str, str | None, str | None]:
     body = " ".join(p for p in body_parts if p).strip().strip("\"'").strip()
     if not body and not title:
         # Model ignored the format — treat the whole thing as the summary.
-        return None, _sanitize_summary(raw.strip().strip("\"'").strip()), None
+        return None, _sanitize_summary(raw.strip().strip("\"'").strip()), None, None
     if not body:
         body = raw.strip()
     # Truncation guard: if the model ran out of tokens, BODY ends mid-sentence.
