@@ -1044,7 +1044,12 @@ def _split_polished(raw: str) -> tuple[str | None, str, str | None, str | None]:
         # Model ignored the format — treat the whole thing as the summary.
         return None, _sanitize_summary(raw.strip().strip("\"'").strip()), None, None
     if not body:
-        body = raw.strip()
+        # Model started the TITLE:/BODY: structure but got cut off (ran out
+        # of tokens) before ever writing BODY: — raw.strip() at this point
+        # is just "TITLE: <fragment>" scaffolding, not usable content.
+        # Treat the whole polish as failed so the caller falls back to the
+        # original RSS summary instead of publishing the dangling fragment.
+        return None, "", None, None
     # Truncation guard: if the model ran out of tokens, BODY ends mid-sentence.
     # Drop the dangling partial sentence so the summary always ends cleanly,
     # but only when a clean cut still leaves a substantial body.
@@ -1445,9 +1450,13 @@ def _sanitize_summary(text: str) -> str:
 
 
 # Sentence terminators recognised by _smart_truncate. Includes ASCII
-# (./!/?), Telugu danda (।), and common smart-quote variants. Order
-# doesn't matter; we look for the LAST occurrence of ANY of these.
-_SENTENCE_TERMS = '.।!?"”’'
+# (./!/?) and Telugu danda (।) only. Curly/smart quotes were removed —
+# Telugu news copy routinely uses them to bracket a quoted name/term
+# *inside* a sentence (e.g. ...లోపలి భాగంలో 'కెవ్లార్'...), which made
+# truncation stop right after the quote instead of at the real sentence
+# end. Order doesn't matter; we look for the LAST occurrence of ANY of
+# these.
+_SENTENCE_TERMS = '.।!?'
 
 def _smart_truncate(text: str, max_chars: int) -> str:
     """Truncate `text` to at most max_chars characters, ending at a clean
@@ -2153,9 +2162,14 @@ def main() -> int:
                     p_title, p_body, p_cat, p_level = _split_polished(polished)
                     if p_body:
                         summary_out = p_body
-                    # Use the translated headline when the original is English
-                    # (or always, if we got a clean Telugu title).
-                    if p_title and (a.lang == "en" or _looks_english(a.headline)):
+                    # Always prefer the AI's compressed 8-12 word title when
+                    # we got one — a genuinely completed polish (see
+                    # _split_polished: p_title only survives when BODY: was
+                    # also present, so a truncated response can't leak an
+                    # incomplete title here). Fixes original publisher
+                    # headlines (often 13-16 words with "..") being kept
+                    # verbatim instead of compressed.
+                    if p_title:
                         headline_out = p_title
                     # Refine level using AI result (AI has full article context).
                     a.level = _determine_level(
@@ -2713,7 +2727,12 @@ def backfill_unpolished(store: list[dict], pool: GeminiKeyPool, counters: dict[s
             break
         if polished and len(polished) > 20:
             p_title, p_body, p_cat, p_level = _split_polished(polished)
-            body = p_body or polished
+            if not p_body and not p_title:
+                # Truncated/incomplete polish (see _split_polished) — nothing
+                # usable came back. Leave the article untouched; it'll be
+                # retried on a later run instead of publishing raw scaffold.
+                continue
+            body = p_body or src
             d["ai"] = True
             d["summary"] = body
             d["audioScript"] = body
