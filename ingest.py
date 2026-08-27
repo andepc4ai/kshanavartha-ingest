@@ -91,7 +91,7 @@ log = logging.getLogger("kv-ingest")
 # different database name.
 FIRESTORE_DB_ID = (os.environ.get("FIRESTORE_DB_ID") or "default").strip()
 
-GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash-lite").strip()
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 )
@@ -935,17 +935,24 @@ SUMMARY_PROMPT = (
     "ఏ ఇంగ్లీష్ పదమైనా తెలుగు లిపిలో రాయండి "
     "(ఉదా: police → పోలీసులు, hospital → ఆసుపత్రి, minister → మంత్రి).\n\n"
     "ఖచ్చితంగా ఈ ఆకృతిలో జవాబివ్వండి:\n"
-    "TITLE: <8-12 పదాల్లో ముఖ్య అంశాన్ని తెలిపే శీర్షిక>\n"
+    "TITLE: <8-12 పదాల్లో ముఖ్య అంశాన్ని నేరుగా తెలిపే శీర్షిక — ప్రశ్న రూపంలో వద్దు "
+    "(ఉదా: 'మీకు తెలుసా', 'ఏదో తెలుసా' వంటి క్లిక్‌బెయిట్ ప్రశ్నలు వాడవద్దు; "
+    "బదులుగా అసలు వాస్తవాన్నే శీర్షికలో చెప్పండి).>\n"
     "BODY: <మూడు నుండి నాలుగు వాక్యాలు, ~70-100 పదాలు. "
     "మొదటి వాక్యమే అత్యంత ముఖ్యమైన లేదా ఆశ్చర్యకరమైన విషయాన్ని తెలపాలి. "
     "తర్వాతి వాక్యాలు ఎవరు, ఏం జరిగింది, ఎందుకు ముఖ్యమో చెప్పాలి. "
+    "మూల వచనం ఏదైనా ప్రశ్న లేవనెత్తినా లేదా క్లిక్‌బెయిట్ శైలిలో ఉన్నా, దానికి అసలు "
+    "సమాధానం/వాస్తవాన్ని BODY లో స్పష్టంగా చెప్పాలి — పాఠకుడిని సమాధానం కోసం మరో లింక్ "
+    "క్లిక్ చేయాల్సిన అవసరం రాకుండా చూడండి. "
     "ప్రతి వాక్యం కొత్త సమాచారం ఇవ్వాలి — పునరావృతం వద్దు. "
     "ఆడియోగా వినిపించబడతాయి కాబట్టి సరళమైన తెలుగు వాడండి. "
     "మూలంలో లేని విషయాలు చేర్చవద్దు — నిడివి కోసం సాగదీయవద్దు. "
     "ప్రతి వాక్యం పూర్తి చేయండి — మధ్యలో ఆపవద్దు.>\n\n"
     "నియమాలు: తటస్థ, వాస్తవిక భాష. అభిప్రాయం, నింపుడు మాటలు వద్దు. "
     "బుల్లెట్లు/నంబర్లు వద్దు (వచనం మాత్రమే). "
-    "TITLE:, BODY: ట్యాగ్లు ఇంగ్లీష్‌లోనే ఉంచండి.\n\n"
+    "TITLE:, BODY: ట్యాగ్లు ఇంగ్లీష్‌లోనే ఉంచండి. "
+    "జవాబులో TITLE: మరియు BODY: లైన్లు మాత్రమే ఉండాలి — పద సంఖ్యలు, స్వీయ-సమీక్ష "
+    "వ్యాఖ్యలు, డ్రాఫ్ట్ నోట్స్, వివరణలు ఇతర ఏమీ చేర్చవద్దు.\n\n"
     "శీర్షిక: {headline}\nమూల వచనం: {summary}"
 )
 
@@ -1110,7 +1117,17 @@ def gemini_summarize(pool: GeminiKeyPool, headline: str, raw_summary: str, promp
         "contents": [{"role": "user", "parts": [{
             "text": prompt.format(headline=headline, summary=raw_summary),
         }]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 450, "topP": 0.8},
+        # 2026-08-27: gemini-2.0-flash (the old default) was retired by
+        # Google. Its thinking-model successors (gemini-3.6-flash etc.)
+        # burn 700-800+ tokens of hidden reasoning before any visible text
+        # — same failure class as the documented Cerebras gpt-oss-120b
+        # max_tokens issue, and thinkingBudget:0 is rejected as invalid for
+        # those models, so it can't be disabled. gemini-3.5-flash-lite
+        # doesn't have this problem (verified: clean TITLE:/BODY: output,
+        # no thoughtsTokenCount, ~185 tokens for a full summary) — that's
+        # now the default. 1500 is a generous cap kept as safety margin,
+        # not a cost driver (billing is by tokens actually generated).
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1500, "topP": 0.8},
     }
     while True:
         key = pool.current()
@@ -2124,14 +2141,14 @@ def main() -> int:
             headline_out = a.headline
             summary_out = a.summary
             skip_english = (a.lang == "en") and not POLISH_ENGLISH
-            # Skip AI when the RSS feed already delivered a full Telugu summary
-            # (≥60 Telugu words). Native feeds like Sakshi/BBC Telugu/NTV often
-            # provide 80-120 word descriptions — polishing them wastes quota and
-            # rarely improves quality for already-fluent Telugu content.
-            # IMPORTANT: these articles are marked ai=True below even though
-            # no AI ran — the content is already publication-quality Telugu,
-            # so they deserve audio narration and full feed treatment.
-            skip_te_rich = (a.lang == "te") and (_te_word_count(a.summary) >= 60)
+            # Disabled 2026-08-27: native-rich Telugu articles used to skip AI
+            # entirely and publish the raw RSS body's first 600 chars as-is.
+            # Long-form/explainer pieces (e.g. "did you know X" listicles) put
+            # their payoff well past 600 chars, so this systematically shipped
+            # summaries that dangle without ever answering their own headline.
+            # Route these through the AI cascade like everything else so the
+            # summary is always a coherent, self-contained rewrite.
+            skip_te_rich = False
             # YouTube items: headline + description are already the publisher's
             # own copy; no value in AI-rewriting it. Saves quota.
             skip_video = a.video_id is not None
@@ -2154,8 +2171,13 @@ def main() -> int:
                     if _category_is_confident(a.link, a.headline, a.summary)
                     else SUMMARY_PROMPT_WITH_CAT
                 )
+                # Feed the AI the richer a.body (up to 2500 chars) rather than
+                # a.summary (truncated to 600 chars at parse time) — the 600
+                # char cap routinely cut long-form/explainer articles off
+                # before the payoff the headline promises, so the AI never
+                # saw enough of the source to write a complete summary.
                 polished, _engine = polish_one(
-                    pool, a.headline, a.summary, counters, MAX_TOTAL_GEMINI,
+                    pool, a.headline, a.body, counters, MAX_TOTAL_GEMINI,
                     prompt=_prompt,
                 )
                 if polished and len(polished) > 20:

@@ -47,7 +47,7 @@ SAMBANOVA_KEYS  = _keys("SAMBANOVA_API_KEYS", "SAMBANOVA_API_KEY")
 # ── Model names (same as ingest.py) ──────────────────────────────────────────
 CEREBRAS_MODEL  = os.environ.get("CEREBRAS_MODEL",  "gpt-oss-120b").strip()
 SAMBANOVA_MODEL = os.environ.get("SAMBANOVA_MODEL", "Meta-Llama-3.3-70B-Instruct").strip()
-GEMINI_MODEL    = "gemini-2.0-flash"
+GEMINI_MODEL    = "gemini-3.5-flash-lite"
 
 CEREBRAS_URL  = "https://api.cerebras.ai/v1/chat/completions"
 SAMBANOVA_URL = "https://api.sambanova.ai/v1/chat/completions"
